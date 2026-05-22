@@ -3,9 +3,10 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { runCommand, terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -151,77 +152,91 @@ function isSessionStale(session) {
   return false;
 }
 
-// Default kill for stale-rotation teardown. Without this, rotating a still-alive
-// broker only removes its socket/pid files — the detached process keeps running
-// and leaks host resources. SIGTERM is best-effort; ignore missing-process errors.
-function defaultKillProcess(pid) {
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    // process already gone — fine
+// Recycled-PID guard used before signaling a stale broker. #262's earlier
+// POSIX-only `verifyBrokerPid` was superseded here by #343's
+// `isExpectedBrokerProcess`, which adds Windows support and is injectable for
+// tests (runCommandImpl/platform). teardownBrokerSession runs this check
+// itself before killing, so callers no longer need a separate gate.
+function readPidFile(pidFile) {
+  if (!pidFile || !fs.existsSync(pidFile)) {
+    return null;
   }
+  const value = Number(fs.readFileSync(pidFile, "utf8").trim());
+  return Number.isFinite(value) ? value : null;
 }
 
-// Cross-check session.pid against the actual running process before signaling.
-//
-// pid-file alone is insufficient: app-server-broker.mjs only removes it in the
-// clean shutdown() path — if the broker crashed ungracefully the pidfile
-// lingers, and when the OS recycles that PID to an unrelated process the file
-// contents will spuriously match. On POSIX we also check `ps` command line to
-// confirm the broker script name is present. On Windows we intentionally do
-// not send SIGTERM: `tasklist` exposes image name but not full command line
-// via the public CLI, and matching on image-name (`node.exe`) alone is too
-// weak to rule out recycled-PID foreign processes. Windows rotation will
-// still clean up socket/pidfile — detached old broker eventually exits on
-// its own since no new client will reach it.
-function verifyBrokerPid(session) {
-  if (!session || !Number.isFinite(session.pid) || !session.pidFile) return false;
-  if (process.platform === "win32") return false;
-  try {
-    if (!fs.existsSync(session.pidFile)) return false;
-    const content = fs.readFileSync(session.pidFile, "utf8").trim();
-    if (Number(content) !== session.pid) return false;
-    // POSIX: ps exposes the full command, so match instance-specific args.
-    // Script name alone is too broad — a recycled PID belonging to a foreign
-    // broker instance (different workspace) would also contain
-    // "app-server-broker.mjs" and cause a cross-session kill. We also require
-    // the session's unique --pid-file and --endpoint paths to appear in the
-    // live command line. Those paths are per-session (see spawnBrokerProcess —
-    // both are derived from createBrokerSessionDir()), so a recycled PID on
-    // an unrelated broker cannot match.
-    const cmd = execFileSync("ps", ["-p", String(session.pid), "-o", "command="], {
-      encoding: "utf8",
-      timeout: 1000
-    });
-    if (!cmd.includes("app-server-broker.mjs")) return false;
-    if (!cmd.includes(`--pid-file ${session.pidFile}`)) return false;
-    if (session.endpoint && !cmd.includes(`--endpoint ${session.endpoint}`)) return false;
-    return true;
-  } catch {
-    // Any lookup failure (process gone, permission denied, timeout) → skip
-    // the kill. Safe default; socket/pidfile cleanup still proceeds.
+function getProcessCommand(pid, options = {}) {
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const platform = options.platform ?? process.platform;
+  const result =
+    platform === "win32"
+      ? runCommandImpl(
+          "powershell",
+          [
+            "-NoProfile",
+            "-Command",
+            `$process = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($process) { $process.CommandLine }`
+          ],
+          {
+            cwd: options.cwd,
+            env: options.env
+          }
+        )
+      : runCommandImpl("ps", ["-p", String(pid), "-o", "command="], {
+          cwd: options.cwd,
+          env: options.env
+        });
+  if (result.error || result.status !== 0) {
+    return null;
+  }
+  return result.stdout.trim();
+}
+
+function isExpectedBrokerProcess({ pid, endpoint = null, pidFile = null, platform = process.platform, runCommandImpl = runCommand }) {
+  if (!Number.isFinite(pid)) {
     return false;
   }
+
+  const recordedPid = readPidFile(pidFile);
+  if (recordedPid !== null && recordedPid !== pid) {
+    return false;
+  }
+
+  const command = getProcessCommand(pid, { platform, runCommandImpl });
+  if (!command) {
+    return false;
+  }
+
+  return (
+    command.includes("app-server-broker.mjs") &&
+    command.includes("serve") &&
+    (!endpoint || command.includes(endpoint)) &&
+    (!pidFile || command.includes(pidFile))
+  );
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  const killProcess = options.killProcess ?? terminateProcessTree;
   const existing = loadBrokerSession(cwd);
   if (existing && !isSessionStale(existing) && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
   }
 
   if (existing) {
-    // Only send SIGTERM when the pid-file on disk still maps to session.pid —
-    // otherwise the PID may have been recycled by the OS to an unrelated
-    // process and signaling it would kill something we don't own.
-    const killAllowed = verifyBrokerPid(existing);
+    // teardownBrokerSession runs its own recycled-PID guard
+    // (validateProcess → isExpectedBrokerProcess) before signaling, and
+    // defaults killProcess to terminateProcessTree so the whole broker +
+    // app-server + MCP subtree is reaped, not just the broker PID.
     teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
       pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? (killAllowed ? defaultKillProcess : null)
+      killProcess,
+      validateProcess: options.validateProcess,
+      platform: options.platform,
+      runCommandImpl: options.runCommandImpl
     });
     clearBrokerSession(cwd);
   }
@@ -252,7 +267,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile,
       sessionDir,
       pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
+      killProcess,
+      validateProcess: options.validateProcess,
+      platform: options.platform,
+      runCommandImpl: options.runCommandImpl
     });
     return null;
   }
@@ -268,8 +286,18 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess) {
+export function teardownBrokerSession({
+  endpoint = null,
+  pidFile,
+  logFile,
+  sessionDir = null,
+  pid = null,
+  killProcess = terminateProcessTree,
+  validateProcess = isExpectedBrokerProcess,
+  platform = process.platform,
+  runCommandImpl = runCommand
+}) {
+  if (Number.isFinite(pid) && validateProcess({ pid, endpoint, pidFile, platform, runCommandImpl })) {
     try {
       killProcess(pid);
     } catch {
