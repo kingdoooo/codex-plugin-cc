@@ -58,9 +58,21 @@ const DEFAULT_CONTINUE_PROMPT =
 // calls runAppServerTurn: a long-thinking or long-single-command task would
 // otherwise be aborted at this threshold with no task-level way to raise or
 // disable it. Review callers opt in via resolveReviewTurnIdleTimeoutMs(); the
-// runners pass whatever they are given straight through to captureTurn, which
-// arms no watchdog for an absent/invalid value.
+// runners pass whatever they are given straight through to captureTurn. When
+// no explicit value is supplied, captureTurn falls back to the generous
+// always-on stall default below (env-tunable), so task runs are still bounded.
 const DEFAULT_TURN_IDLE_TIMEOUT_MS = 180_000;
+
+// Always-on turn guards (from upstream PR #361). Every captureTurn is bounded
+// three ways so a wedged turn fails toward "didn't finish" instead of hanging:
+//   - stall:   no BELONGING traffic for this long => stalled. Review callers
+//     pass an explicit (tighter) turnIdleTimeoutMs; everything else gets this
+//     default, overridable via CODEX_COMPANION_TURN_STALL_MS.
+//   - ceiling: absolute backstop on a single turn's total duration,
+//     overridable via CODEX_COMPANION_TURN_TIMEOUT_MS.
+//   - exit:    app-server process death rejects immediately.
+const DEFAULT_TURN_STALL_MS = 600_000;
+const DEFAULT_TURN_CEILING_MS = 1_800_000;
 
 // Demoted-inference quiet window (Defect A). Inferred turn completion is a
 // FALLBACK for the subagent/collab case where the main thread never emits a
@@ -85,12 +97,31 @@ function resolveInferredCompletionQuietMs(explicitMs) {
 /**
  * Resolve the idle-watchdog timeout for REVIEW turns. Returns the review
  * default when no explicit positive value is supplied. Task runs do not call
- * this and therefore run without an idle watchdog.
+ * this; captureTurn bounds them with the always-on stall default instead.
  * @param {number | null | undefined} explicitMs
  * @returns {number}
  */
 export function resolveReviewTurnIdleTimeoutMs(explicitMs) {
   return Number.isFinite(explicitMs) && explicitMs > 0 ? explicitMs : DEFAULT_TURN_IDLE_TIMEOUT_MS;
+}
+
+function resolveTurnStallMs(explicitMs) {
+  if (Number.isFinite(explicitMs) && explicitMs > 0) {
+    return explicitMs;
+  }
+  const fromEnv = Number(process.env.CODEX_COMPANION_TURN_STALL_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  return DEFAULT_TURN_STALL_MS;
+}
+
+function resolveTurnCeilingMs() {
+  const fromEnv = Number(process.env.CODEX_COMPANION_TURN_TIMEOUT_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  return DEFAULT_TURN_CEILING_MS;
 }
 
 function cleanCodexStderr(stderr) {
@@ -628,26 +659,45 @@ function applyTurnNotification(state, message) {
   }
 }
 
+// Best-effort interrupt of a turn being abandoned by a watchdog, bounded so the
+// teardown cannot itself hang on the same dead link that stalled the turn. On
+// the broker transport this is forwarded to the upstream app-server, which
+// stops the turn so it cannot overlap a retry or keep mutating the workspace.
+async function interruptTurnBestEffort(client, threadId, turnId) {
+  if (!threadId || !turnId) {
+    return;
+  }
+  try {
+    await Promise.race([
+      client.request("turn/interrupt", { threadId, turnId }),
+      new Promise((_resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("turn/interrupt timed out")), 5_000);
+        timer.unref?.();
+      })
+    ]);
+  } catch {
+    // Best-effort: the turn is being abandoned regardless of the interrupt outcome.
+  }
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
-  // Idle watchdog: the turn/start RPC and the completion promise only settle on
-  // a server response or a full socket close. A half-dead "Reconnecting..."
-  // link delivers neither, so without this the turn would hang forever. We
-  // reject after `idleTimeoutMs` of total silence, re-arming on every progress
-  // notification so a slow-but-active turn is never killed.
-  const idleTimeoutMs = Number.isFinite(options.turnIdleTimeoutMs) && options.turnIdleTimeoutMs > 0
-    ? options.turnIdleTimeoutMs
-    : null;
+  // Stall watchdog: the turn/start RPC and the completion promise only settle
+  // on a server response or a full socket close. A half-dead "Reconnecting..."
+  // link, a hung MCP server, or a wedged turn delivers neither, so without this
+  // the turn would hang forever. We reject after `stallMs` of silence,
+  // re-arming ONLY on traffic that belongs to this turn (Defect B: foreign
+  // chatter must not mask a stuck turn). Review callers pass a tight explicit
+  // window; everything else gets the generous always-on default.
+  const stallMs = resolveTurnStallMs(options.turnIdleTimeoutMs);
   let idleTimer = null;
   let idleReject = null;
   let settled = false;
-  const idlePromise = idleTimeoutMs
-    ? new Promise((_resolve, reject) => { idleReject = reject; })
-    : null;
+  const idlePromise = new Promise((_resolve, reject) => { idleReject = reject; });
   const armIdle = () => {
-    if (!idleTimeoutMs || settled) {
+    if (settled) {
       return;
     }
     if (idleTimer) {
@@ -657,19 +707,16 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       if (settled) {
         return;
       }
-      const seconds = Math.round(idleTimeoutMs / 1000);
-      // Best-effort interrupt so the app-server can release the turn; do NOT
-      // await it (the same dead link could make it hang too).
-      const interruptTurnId = state.turnId ?? state.pendingTurnId;
-      if (interruptTurnId) {
-        try {
-          client.request("turn/interrupt", { threadId, turnId: interruptTurnId }).catch(() => {});
-        } catch {
-          // ignore — interrupt is best-effort
-        }
-      }
-      idleReject?.(new Error(`Turn idle for ${seconds}s; aborting (upstream connection appears stalled).`));
-    }, idleTimeoutMs);
+      const seconds = Math.round(stallMs / 1000);
+      idleReject?.(
+        Object.assign(
+          new Error(
+            `Turn idle: no activity for ${seconds}s; aborting (stalled turn or upstream connection — raise CODEX_COMPANION_TURN_STALL_MS or --turn-idle-timeout for long silent turns).`
+          ),
+          { turnAbandoned: true }
+        )
+      );
+    }, stallMs);
     idleTimer.unref?.();
   };
   const clearIdle = () => {
@@ -679,6 +726,36 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       idleTimer = null;
     }
   };
+
+  // Absolute ceiling on a single turn (from PR #361): even a turn that keeps
+  // trickling belonging traffic cannot run unbounded.
+  const ceilingMs = resolveTurnCeilingMs();
+  let ceilingTimer = null;
+  const ceiling = new Promise((_resolve, reject) => {
+    ceilingTimer = setTimeout(() => {
+      reject(
+        Object.assign(
+          new Error(
+            `Codex turn exceeded the ${Math.round(ceilingMs / 1000)}s ceiling without completing (raise CODEX_COMPANION_TURN_TIMEOUT_MS for long turns). Treating as stalled.`
+          ),
+          { turnAbandoned: true }
+        )
+      );
+    }, ceilingMs);
+    ceilingTimer.unref?.();
+  });
+
+  // App-server process death rejects immediately instead of leaving
+  // `await state.completion` hanging forever (from PR #361).
+  const exit = client.exitPromise.then(() => {
+    if (state.completed) {
+      return state;
+    }
+    throw Object.assign(
+      new Error(client.exitError?.message ?? "codex app-server exited before the turn completed."),
+      { turnAbandoned: true }
+    );
+  });
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -715,11 +792,12 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     applyTurnNotification(state, message);
   });
 
-  try {
-    armIdle();
-    const response = idlePromise
-      ? await Promise.race([startRequest(), idlePromise])
-      : await startRequest();
+  // Wrap the start RPC and response processing so the guards also cover a
+  // start request that hangs or rejects before the turn is ever established,
+  // and so every guard is observed by Promise.race from the outset (no
+  // unhandledRejection from a guard that fires before/after the race settles).
+  const work = (async () => {
+    const response = await startRequest();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -740,11 +818,32 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return idlePromise
-      ? await Promise.race([state.completion, idlePromise])
-      : await state.completion;
+    return await state.completion;
+  })();
+
+  try {
+    armIdle();
+    // `work` wins under normal operation; the guards only fire on a stall, an
+    // over-long turn, or app-server death.
+    return await Promise.race([work, idlePromise, ceiling, exit]);
+  } catch (error) {
+    // A watchdog abandoned a turn that may still be running upstream. Stopping
+    // our wait is not enough — on a shared broker the turn keeps mutating the
+    // workspace and can collide with the next task; on the direct transport the
+    // interrupt releases the turn before close() kills the server. Use the
+    // buffered pendingTurnId too (Defect C): the turn/start RPC reply may never
+    // have arrived even though turn/started announced an id. The interrupt is
+    // awaited but bounded (5s) so this teardown cannot itself hang.
+    const interruptTurnId = state.turnId ?? state.pendingTurnId;
+    if (error?.turnAbandoned && !state.completed && interruptTurnId) {
+      await interruptTurnBestEffort(client, threadId, interruptTurnId);
+    }
+    throw error;
   } finally {
     clearIdle();
+    if (ceilingTimer) {
+      clearTimeout(ceilingTimer);
+    }
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
