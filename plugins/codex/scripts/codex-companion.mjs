@@ -373,6 +373,34 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   return findLatestTaskThread(workspaceRoot);
 }
 
+// Failed reviews used to return only the finalize turn's (often empty)
+// message, stranding the recon findings in the job log. Build a digest of
+// each recon turn's last message; ride it on `rawOutput` so the renderer's
+// existing "Partial investigation output" section and the /codex:status
+// failed-job view surface it without changes. The trailing final-message
+// section is skipped when it duplicates the last digest entry (a recon
+// soft-error's message is already the last entry — the accumulator pushes
+// before the error check).
+function buildInvestigationDigest(investigationMessages, finalMessage) {
+  if (!Array.isArray(investigationMessages) || investigationMessages.length === 0) {
+    return null;
+  }
+  const sections = investigationMessages.map(
+    (entry) => `--- Investigation turn ${entry.turn} ---\n${entry.text}`
+  );
+  const finalText = String(finalMessage ?? "").trim();
+  // Compare trimmed-vs-trimmed: on a recon soft-error return the failed
+  // turn's message is already the last digest entry, and trailing
+  // whitespace on either side must not defeat the dedup.
+  const lastEntryText = String(
+    investigationMessages[investigationMessages.length - 1].text ?? ""
+  ).trim();
+  if (finalText && finalText !== lastEntryText) {
+    sections.push(`--- Final message (failed run) ---\n${finalText}`);
+  }
+  return sections.join("\n\n");
+}
+
 async function executeReviewRun(request) {
   ensureCodexAvailable(request.cwd);
   ensureGitRepository(request.cwd);
@@ -523,7 +551,9 @@ async function executeReviewRun(request) {
       failed: true,
       failureMessage:
         result.error?.message ?? result.stderr ?? "Codex run failed before producing output.",
-      rawOutput: result.finalMessage ?? ""
+      rawOutput:
+        buildInvestigationDigest(result.investigationMessages, result.finalMessage) ??
+        (result.finalMessage ?? "")
     };
   } else if (!hasFinalMessage && !structured.parsed) {
     // The turn completed (status 0, no error) but emitted no agent message —
@@ -536,7 +566,7 @@ async function executeReviewRun(request) {
       parseError: null,
       failed: true,
       failureMessage: "Codex completed the turn but returned no review content.",
-      rawOutput: ""
+      rawOutput: buildInvestigationDigest(result.investigationMessages, result.finalMessage) ?? ""
     };
   } else {
     parsed = structured;

@@ -1059,6 +1059,67 @@ test("finalize turn that recovered from a transient reconnect keeps its valid ve
   }
 });
 
+test("no-content failure carries the investigation digest in rawOutput (e2e)", async () => {
+  // Both finalize attempts come back empty (upstream Message-item drop). The
+  // recon findings used to live only in the job log; now they ride back in
+  // rawOutput so the renderer's "Partial investigation output" section and
+  // /codex:status can show them.
+  const cwd = makeSelfCollectGitFixture();
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({
+      commands: [{ command: "git diff main...HEAD", exitCode: 0 }],
+      finalAnswer: { text: "Turn 1 findings: lock-order risk." }
+    });
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Converged summary." } });
+    fake.queueTurnResponse({ commands: [], finalAnswer: null });
+    fake.queueTurnResponse({ commands: [], finalAnswer: null });
+
+    const result = runCompanion(
+      ["adversarial-review", "--base", "main", "--scope", "branch", "--cwd", cwd, "--json"],
+      fake.env
+    );
+
+    const payload = JSON.parse(result.stdout.trim());
+    assert.equal(payload.failed, true, "no-content run is flagged failed");
+    assert.match(payload.failureMessage ?? "", /no review content/);
+    assert.match(payload.rawOutput ?? "", /--- Investigation turn 1 ---/);
+    assert.match(payload.rawOutput ?? "", /lock-order risk/);
+    assert.match(payload.rawOutput ?? "", /--- Investigation turn 2 ---/);
+    assert.match(payload.rawOutput ?? "", /Converged summary\./);
+  } finally {
+    fake.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("transport failure mid-recon still carries earlier findings in rawOutput (e2e)", async () => {
+  const cwd = makeSelfCollectGitFixture();
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({
+      commands: [{ command: "git diff main...HEAD", exitCode: 0 }],
+      finalAnswer: { text: "Turn 1 findings: lock-order risk." }
+    });
+    fake.queueTurnRpcError({ message: "stream disconnected before completion" });
+
+    const result = runCompanion(
+      ["adversarial-review", "--base", "main", "--scope", "branch", "--cwd", cwd, "--json"],
+      fake.env
+    );
+
+    assert.notEqual(result.status, 0, "a transport-failed run exits non-zero");
+    const payload = JSON.parse(result.stdout.trim());
+    assert.equal(payload.failed, true);
+    assert.match(payload.failureMessage ?? "", /stream disconnected/);
+    assert.match(payload.rawOutput ?? "", /--- Investigation turn 1 ---/);
+    assert.match(payload.rawOutput ?? "", /lock-order risk/);
+  } finally {
+    fake.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 // -------------------------------------------------------------------
 // Unit tests for runAppServerInvestigation (continued from above)
 // -------------------------------------------------------------------
