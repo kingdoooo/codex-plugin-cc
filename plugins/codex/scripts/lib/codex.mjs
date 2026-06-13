@@ -1337,6 +1337,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
     let totalCommandsRun = 0;
     const aggregatedCommandExecutions = [];
     const aggregatedFileChanges = [];
+    const investigationMessages = [];
 
     for (let i = 1; i <= maxInvestigationTurns; i += 1) {
       const promptText = i === 1 ? investigatePrompt : INVESTIGATION_CONTINUATION_CUE;
@@ -1370,11 +1371,15 @@ export async function runAppServerInvestigation(cwd, options = {}) {
           fileChanges: aggregatedFileChanges,
           touchedFiles: collectTouchedFiles(aggregatedFileChanges),
           commandExecutions: aggregatedCommandExecutions,
+          investigationMessages,
           investigation: { turnCount, truncated: false }
         };
       }
 
       turnCount = i;
+      if (turnState.lastAgentMessage && turnState.lastAgentMessage.trim()) {
+        investigationMessages.push({ turn: i, text: turnState.lastAgentMessage });
+      }
       const turnCommandCount = turnState.commandExecutions.length;
       totalCommandsRun += turnCommandCount;
       for (const cmd of turnState.commandExecutions) {
@@ -1408,6 +1413,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
           fileChanges: aggregatedFileChanges,
           touchedFiles: collectTouchedFiles(aggregatedFileChanges),
           commandExecutions: aggregatedCommandExecutions,
+          investigationMessages,
           investigation: { turnCount, truncated: false }
         };
       }
@@ -1477,6 +1483,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
           fileChanges: aggregatedFileChanges,
           touchedFiles: collectTouchedFiles(aggregatedFileChanges),
           commandExecutions: aggregatedCommandExecutions,
+          investigationMessages,
           investigation: { turnCount, truncated }
         };
       }
@@ -1526,6 +1533,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
       fileChanges: aggregatedFileChanges,
       touchedFiles: collectTouchedFiles(aggregatedFileChanges),
       commandExecutions: aggregatedCommandExecutions,
+      investigationMessages,
       investigation: { turnCount, truncated }
     };
   });

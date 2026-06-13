@@ -597,6 +597,65 @@ test("recon turn 1 sends the investigate prompt; turn 2+ sends the continuation 
   }
 });
 
+test("investigation messages are carried on the success path", async () => {
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Recon turn 1: productive — runs a command AND posts a findings summary
+    // (commands > 0, so the loop does not converge yet).
+    fake.queueTurnResponse({
+      commands: [{ command: "git diff", exitCode: 0 }],
+      finalAnswer: { text: "Turn 1 findings: lock-order risk in a.js." }
+    });
+    // Recon turn 2: converges.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Converged: summary." } });
+    // Finalize.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: APPROVE_REVIEW } });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] }
+    });
+
+    assert.equal(result.finalMessage, APPROVE_REVIEW);
+    assert.deepEqual(result.investigationMessages, [
+      { turn: 1, text: "Turn 1 findings: lock-order risk in a.js." },
+      { turn: 2, text: "Converged: summary." }
+    ], "each recon turn's last message must be collected in order");
+  } finally {
+    fake.close();
+  }
+});
+
+test("investigation messages survive a recon failure (idle timeout)", async () => {
+  // When a later recon turn dies, findings already collected by earlier turns
+  // must ride back on the result so the companion can surface them.
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({
+      commands: [{ command: "git diff", exitCode: 0 }],
+      finalAnswer: { text: "Turn 1 findings: lock-order risk in a.js." }
+    });
+    // Recon turn 2: the server never responds; the idle watchdog aborts.
+    fake.queueTurnHang();
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      turnIdleTimeoutMs: 300
+    });
+
+    assert.ok(result.error, "the timed-out run still reports its error");
+    assert.deepEqual(result.investigationMessages, [
+      { turn: 1, text: "Turn 1 findings: lock-order risk in a.js." }
+    ], "turn 1's findings must survive the turn 2 failure");
+  } finally {
+    fake.close();
+  }
+});
+
 // -------------------------------------------------------------------
 // Integration tests: subprocess-based end-to-end companion tests
 // -------------------------------------------------------------------
