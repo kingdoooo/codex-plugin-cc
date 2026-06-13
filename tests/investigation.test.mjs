@@ -656,6 +656,100 @@ test("investigation messages survive a recon failure (idle timeout)", async () =
   }
 });
 
+test("empty finalize message triggers one targeted retry", async () => {
+  // Production failure 2026-06-12 (review-mqar3xtr): the finalize turn
+  // completed cleanly but the upstream dropped the Message item — the turn
+  // ended with zero agent messages. Treat it as a contract violation and
+  // retry once with an empty-specific reminder.
+  //
+  // SCOPE: this verifies the retry MECHANISM wires up (a second finalize
+  // attempt is made, with the empty-specific reminder). It does NOT prove
+  // the retry recovers in production — the bug is intermittent and
+  // prompt-independent, so attempt 2 succeeding here is a fixture
+  // stipulation, not evidence of efficacy. The real guarantee is the
+  // digest test below ("two empty finalize attempts...").
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Recon: converge immediately.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    // First finalize attempt: completes with NO message at all.
+    fake.queueTurnResponse({ commands: [], finalAnswer: null });
+    // Second finalize attempt: proper JSON.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: APPROVE_REVIEW } });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] }
+    });
+
+    assert.equal(result.finalMessage, APPROVE_REVIEW, "the retry's output is the final message");
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 3, "1 recon + 2 finalize attempts");
+    const finalizeStarts = starts.slice(1);
+    assert.match(finalizeStarts[1].params.input?.[0]?.text ?? "", /no structured output was received/,
+      "retry prompt must use the empty-message reminder");
+    assert.doesNotMatch(finalizeStarts[1].params.input?.[0]?.text ?? "", /do not run any shell commands/,
+      "the commands-ran reminder is the wrong one for an empty reply");
+    assert.doesNotMatch(finalizeStarts[0].params.input?.[0]?.text ?? "", /STRICT FINALIZE/,
+      "first finalize attempt uses the normal prompt");
+  } finally {
+    fake.close();
+  }
+});
+
+test("two empty finalize attempts exhaust the budget and surface the empty result", async () => {
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake.queueTurnResponse({ commands: [], finalAnswer: null });
+    fake.queueTurnResponse({ commands: [], finalAnswer: null });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] }
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 3, "1 recon + 2 finalize attempts only — no loop");
+    assert.equal(result.finalMessage, "", "empty result surfaced for the caller to flag");
+    assert.deepEqual(result.investigationMessages, [{ turn: 1, text: "Investigation done." }],
+      "findings still ride back for the failure payload");
+  } finally {
+    fake.close();
+  }
+});
+
+test("mixed finalize violations (commands then empty) do not earn a third attempt", async () => {
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    // Attempt 1 violates by running a command.
+    fake.queueTurnResponse({
+      commands: [{ command: "wc -l a", exitCode: 0 }],
+      finalAnswer: { text: "{\"cmd\":\"wc -l a\"}" }
+    });
+    // Attempt 2 violates differently: empty message.
+    fake.queueTurnResponse({ commands: [], finalAnswer: null });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] }
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 3, "budget is shared across violation kinds");
+    assert.equal(result.finalMessage, "", "second attempt's empty output is accepted as-is");
+  } finally {
+    fake.close();
+  }
+});
+
 // -------------------------------------------------------------------
 // Integration tests: subprocess-based end-to-end companion tests
 // -------------------------------------------------------------------

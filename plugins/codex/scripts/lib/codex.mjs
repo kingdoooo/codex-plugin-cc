@@ -1442,20 +1442,34 @@ export async function runAppServerInvestigation(cwd, options = {}) {
     emitProgress(options.onProgress, "Investigation complete; finalizing structured output.", "finalizing");
 
     // The finalize turn is supposed to emit only the structured JSON. In
-    // practice the model sometimes emits a tool-call stub instead (e.g.
-    // {"cmd": "wc -l ..."}) — if any commands ran during finalize, treat
-    // that as a contract violation and retry once with a sharper prompt.
+    // practice the model violates the contract in one of two ways: it emits a
+    // tool-call stub instead (e.g. {"cmd": "wc -l ..."}) — commands ran during
+    // finalize — or the upstream drops the Message item entirely and the turn
+    // completes with no agent message at all (observed on the Bedrock mantle
+    // transport: output billed, Message item never delivered). Either way,
+    // retry once with a violation-specific sharper prompt.
     const STRICT_FINALIZE_REMINDER =
       "STRICT FINALIZE: do not run any shell commands. Output ONLY the JSON " +
       "matching the schema, with no prose, no tool calls, and nothing else.\n\n";
+    // Worded neutrally on purpose: the empty case is almost always an
+    // upstream Message-item drop (the model already emitted JSON, billed as
+    // output_tokens), NOT the model sending nothing. Asserting "you sent
+    // nothing" would be factually wrong and could confuse a model that
+    // succeeded. The retry is a re-roll on a flaky transport, not a prompt
+    // fix.
+    const EMPTY_FINALIZE_REMINDER =
+      "STRICT FINALIZE: no structured output was received from your previous " +
+      "turn. Re-emit the JSON verdict matching the schema as a normal " +
+      "assistant message — no tool calls, no empty replies, nothing else.\n\n";
     let finalizeState;
     let finalizeAttempts = 0;
+    let finalizeViolation = null; // null | "commands" | "empty"
     const MAX_FINALIZE_ATTEMPTS = 2;
     while (finalizeAttempts < MAX_FINALIZE_ATTEMPTS) {
       finalizeAttempts += 1;
-      const promptText = finalizeAttempts === 1
+      const promptText = finalizeViolation === null
         ? finalizePrompt
-        : STRICT_FINALIZE_REMINDER + finalizePrompt;
+        : (finalizeViolation === "empty" ? EMPTY_FINALIZE_REMINDER : STRICT_FINALIZE_REMINDER) + finalizePrompt;
       try {
         finalizeState = await captureTurn(
           client,
@@ -1488,16 +1502,20 @@ export async function runAppServerInvestigation(cwd, options = {}) {
         };
       }
 
-      // If the finalize turn ran commands, the model violated the contract.
-      // Retry once with a stricter prompt; if it still fails, accept the
-      // (likely-malformed) output and let the parser surface the error.
-      if (finalizeState.commandExecutions.length === 0) {
+      // A well-behaved finalize runs no commands AND emits the JSON as an
+      // agent message. Either violation retries once with a sharper prompt
+      // (shared budget); if the second attempt still violates, accept the
+      // output and let the caller's parser/no-content handling flag it.
+      if (finalizeState.commandExecutions.length === 0 && finalizeState.lastAgentMessage) {
         break;
       }
+      finalizeViolation = finalizeState.commandExecutions.length > 0 ? "commands" : "empty";
       if (finalizeAttempts < MAX_FINALIZE_ATTEMPTS) {
         emitProgress(
           options.onProgress,
-          "Finalize turn ran commands; retrying with stricter prompt.",
+          finalizeViolation === "empty"
+            ? "Finalize turn returned no message; retrying with stricter prompt."
+            : "Finalize turn ran commands; retrying with stricter prompt.",
           "finalizing"
         );
         // Aggregate the wasted commands from this (about-to-be-superseded)
