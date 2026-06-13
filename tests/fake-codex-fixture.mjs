@@ -513,15 +513,22 @@ rl.on("line", (line) => {
             send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "", phase: "agent_message" } } });
           }
 
+          // The real app-server can deliver the model's message, then an error
+          // notification, then a turn/completed carrying a NON-"completed"
+          // status (e.g. "failed") — a recon turn that produced prose but did
+          // not converge. Default stays "completed" so all existing tests are
+          // unchanged; opt in with turnCompletedStatus to model the soft-error
+          // (non-recovered) case.
+          const completedStatus = (entry && entry.turnCompletedStatus) || "completed";
           if (entry && entry.delayCompletedMs) {
             const completedTurnId = turnId;
             setTimeout(() => {
               if (state.serialize) { serializedBusyThread = null; }
-              send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(completedTurnId, "completed") } });
+              send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(completedTurnId, completedStatus) } });
             }, entry.delayCompletedMs);
           } else {
             if (state.serialize) { serializedBusyThread = null; }
-            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, completedStatus) } });
           }
           break;
         }

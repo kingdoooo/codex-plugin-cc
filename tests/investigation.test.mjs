@@ -1120,6 +1120,57 @@ test("transport failure mid-recon still carries earlier findings in rawOutput (e
   }
 });
 
+test("recon soft-error digest does NOT duplicate the failed turn's message (e2e)", async () => {
+  // Locks in buildInvestigationDigest's dedup-skip branch. When a recon turn
+  // emits a message and then soft-fails (error notification + a NON-"completed"
+  // turn/completed status, so it is not treated as recovered), the loop aborts
+  // with result.finalMessage === that turn's message — which is already the
+  // last digest entry. The trailing "Final message (failed run)" section must
+  // be skipped so the same prose is not printed twice. (The fixture's
+  // turnCompletedStatus knob reproduces the real app-server's deliver-message-
+  // then-fail sequence; without it every fixture turn completes "completed" and
+  // would be treated as recovered, never reaching the soft-error return.)
+  const cwd = makeSelfCollectGitFixture();
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({
+      commands: [{ command: "git diff main...HEAD", exitCode: 0 }],
+      finalAnswer: { text: "Turn 1 findings: lock-order risk." },
+      turnError: { message: "model produced unrenderable response" },
+      turnCompletedStatus: "failed"
+    });
+
+    const result = runCompanion(
+      ["adversarial-review", "--base", "main", "--scope", "branch", "--cwd", cwd, "--json"],
+      fake.env
+    );
+
+    assert.notEqual(result.status, 0, "a soft-failed run exits non-zero");
+    const payload = JSON.parse(result.stdout.trim());
+    assert.equal(payload.failed, true);
+    assert.match(payload.failureMessage ?? "", /model produced unrenderable response/);
+    const rawOutput = payload.rawOutput ?? "";
+    // Exactly one turn-1 section, carrying the recon findings.
+    assert.match(rawOutput, /--- Investigation turn 1 ---/);
+    assert.match(rawOutput, /lock-order risk/);
+    assert.equal(
+      (rawOutput.match(/--- Investigation turn 1 ---/g) ?? []).length,
+      1,
+      "the recon turn's findings must appear exactly once"
+    );
+    // The dedup-skip: finalMessage equals the last digest entry, so the trailing
+    // "Final message (failed run)" section must NOT be appended.
+    assert.doesNotMatch(
+      rawOutput,
+      /--- Final message \(failed run\) ---/,
+      "the duplicate final-message section must be skipped when it matches the last recon entry"
+    );
+  } finally {
+    fake.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 // -------------------------------------------------------------------
 // Unit tests for runAppServerInvestigation (continued from above)
 // -------------------------------------------------------------------

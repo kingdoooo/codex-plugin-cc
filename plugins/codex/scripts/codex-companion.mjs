@@ -551,6 +551,10 @@ async function executeReviewRun(request) {
       failed: true,
       failureMessage:
         result.error?.message ?? result.stderr ?? "Codex run failed before producing output.",
+      // Branch A also serves the inline (runAppServerTurn) path, which has no
+      // investigationMessages — the digest is null there, so fall back to its
+      // finalMessage. (Branch B's no-content case has an empty finalMessage by
+      // definition, so it falls back to "".)
       rawOutput:
         buildInvestigationDigest(result.investigationMessages, result.finalMessage) ??
         (result.finalMessage ?? "")
