@@ -745,6 +745,13 @@ test("mixed finalize violations (commands then empty) do not earn a third attemp
     const starts = fake.requests.filter((r) => r.method === "turn/start");
     assert.equal(starts.length, 3, "budget is shared across violation kinds");
     assert.equal(result.finalMessage, "", "second attempt's empty output is accepted as-is");
+    // The reminder a turn carries describes the PRIOR turn's violation (it is
+    // feedback), so attempt 2's prompt reflects attempt 1's commands violation,
+    // not its own empty result. This proves the violation-kind state was set
+    // from attempt 1 and drove prompt selection for attempt 2.
+    const finalizeStarts = starts.slice(1);
+    assert.match(finalizeStarts[1].params.input?.[0]?.text ?? "", /do not run any shell commands/,
+      "attempt 2's prompt carries the commands reminder for attempt 1's commands violation");
   } finally {
     fake.close();
   }

@@ -1506,7 +1506,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
       // agent message. Either violation retries once with a sharper prompt
       // (shared budget); if the second attempt still violates, accept the
       // output and let the caller's parser/no-content handling flag it.
-      if (finalizeState.commandExecutions.length === 0 && finalizeState.lastAgentMessage) {
+      if (finalizeState.commandExecutions.length === 0 && finalizeState.lastAgentMessage.trim()) {
         break;
       }
       finalizeViolation = finalizeState.commandExecutions.length > 0 ? "commands" : "empty";
