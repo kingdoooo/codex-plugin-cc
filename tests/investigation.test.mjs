@@ -757,6 +757,39 @@ test("mixed finalize violations (commands then empty) do not earn a third attemp
   }
 });
 
+test("investigation messages survive a finalize transport failure", async () => {
+  // The finalize turn's RPC can reject (upstream transport drop) AFTER the
+  // recon turns converged. That return path must still carry the findings.
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Recon turn 1: productive (commands → no converge), posts a finding.
+    fake.queueTurnResponse({
+      commands: [{ command: "git diff", exitCode: 0 }],
+      finalAnswer: { text: "Turn 1 findings: lock-order risk in a.js." }
+    });
+    // Recon turn 2: no commands + message → converges, proceed to finalize.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Converged: summary." } });
+    // Finalize turn: the turn/start RPC rejects (transport failure).
+    fake.queueTurnRpcError({ message: "stream disconnected before completion" });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] }
+    });
+
+    assert.ok(result.error, "a finalize transport failure must surface an error");
+    assert.match(result.error.message ?? "", /stream disconnected/);
+    assert.deepEqual(result.investigationMessages, [
+      { turn: 1, text: "Turn 1 findings: lock-order risk in a.js." },
+      { turn: 2, text: "Converged: summary." }
+    ], "both recon turns' findings must survive a finalize-stage transport failure");
+  } finally {
+    fake.close();
+  }
+});
+
 // -------------------------------------------------------------------
 // Integration tests: subprocess-based end-to-end companion tests
 // -------------------------------------------------------------------
