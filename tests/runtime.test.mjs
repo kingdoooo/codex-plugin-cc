@@ -2522,3 +2522,372 @@ test("broker self-terminates when a client abandons an in-flight start (pre-ACK)
     }
   }, { timeoutMs: 8000, intervalMs: 100 });
 });
+
+// -------------------------------------------------------------------
+// Task 9: --resume / --fresh / --within-hours review thread reuse
+//
+// These CLI tests need the request log (thread/start.ephemeral,
+// thread/resume, thread/name/set), which only the queue-driven fake
+// records — so they install that behavior directly instead of the
+// default review-ok fake used by the other review CLI tests above.
+// -------------------------------------------------------------------
+
+const RESUME_APPROVE_VERDICT = JSON.stringify({
+  verdict: "approve",
+  summary: "No material issues found.",
+  findings: [],
+  next_steps: []
+});
+
+function setupResumeReviewRepo() {
+  const repo = makeTempDir("codex-review-resume-");
+  const binDir = makeTempDir("codex-review-resume-bin-");
+  installFakeCodex(binDir, "queue-driven");
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify(
+      {
+        nextThreadId: 1,
+        nextTurnId: 1,
+        appServerStarts: 0,
+        threads: [],
+        capabilities: null,
+        lastInterrupt: null,
+        queue: [],
+        requests: [],
+        serialize: false
+      },
+      null,
+      2
+    )
+  );
+
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  // Three changed files push the review past the single-file inline-diff cap,
+  // so it routes through the multi-turn self-collect path that owns resume.
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(repo, "src", name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "src/a.js", "src/b.js", "src/c.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(repo, "src", name), `export const value = "${name}-v2";\n`);
+  }
+
+  function readFakeState() {
+    return JSON.parse(fs.readFileSync(statePath, "utf8"));
+  }
+
+  return {
+    repo,
+    binDir,
+    // One recon turn that converges (no commands + a message) plus the
+    // schema-pinned finalize turn: the shortest complete review.
+    queueOneReview() {
+      const state = readFakeState();
+      state.queue.push({ commands: [], finalAnswer: { text: "Investigation done." } });
+      state.queue.push({ finalAnswer: { text: RESUME_APPROVE_VERDICT } });
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
+    queueSlowFirstTurn(delayCompletedMs) {
+      const state = readFakeState();
+      state.queue.push({
+        commands: [],
+        finalAnswer: { text: "Investigation done." },
+        delayCompletedMs
+      });
+      state.queue.push({ finalAnswer: { text: RESUME_APPROVE_VERDICT } });
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
+    clearRequests() {
+      const state = readFakeState();
+      state.requests = [];
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
+    // Models Codex pruning/expiring a persisted thread: the id is still in the
+    // job record, but thread/resume now fails against the server.
+    dropThreads() {
+      const state = readFakeState();
+      state.threads = [];
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
+    get requests() {
+      return readFakeState().requests ?? [];
+    },
+    runReview(args) {
+      return run("node", [SCRIPT, "adversarial-review", ...args], {
+        cwd: repo,
+        env: buildEnv(binDir)
+      });
+    },
+    readReviewJobs() {
+      // The state file only appears once the run records its first job, so
+      // pollers that watch an in-flight run start out with nothing to read.
+      const stateFile = path.join(resolveStateDir(repo), "state.json");
+      if (!fs.existsSync(stateFile)) {
+        return [];
+      }
+      const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      return state.jobs.filter((job) => job.jobClass === "review");
+    },
+    // Rewrites the stored completedAt of every review job in both the state
+    // index and the per-job file, so the recency window sees a stale thread.
+    ageReviewJobs(hoursAgo) {
+      const stateDir = resolveStateDir(repo);
+      const stateFile = path.join(stateDir, "state.json");
+      const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      const staleAt = new Date(Date.now() - hoursAgo * 3600_000).toISOString();
+      for (const job of state.jobs) {
+        if (job.jobClass !== "review") {
+          continue;
+        }
+        job.completedAt = staleAt;
+        const jobFile = path.join(stateDir, "jobs", `${job.id}.json`);
+        if (fs.existsSync(jobFile)) {
+          const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+          stored.completedAt = staleAt;
+          fs.writeFileSync(jobFile, JSON.stringify(stored, null, 2));
+        }
+      }
+      fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`);
+    }
+  };
+}
+
+test("adversarial-review --resume with no prior thread starts a fresh named persistent thread", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+
+  const result = fixture.runReview(["--resume"]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const [job] = fixture.readReviewJobs();
+  assert.equal(job.resumable, true, "session-mode review jobs must be tagged resumable at creation");
+  assert.equal(job.status, "completed");
+  assert.ok(job.threadId, "a completed review must record its thread id");
+
+  const requests = fixture.requests;
+  const starts = requests.filter((entry) => entry.method === "thread/start");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].params.ephemeral, false, "session mode must persist the thread");
+  assert.ok(!requests.some((entry) => entry.method === "thread/resume"), "nothing to resume on the first run");
+  // Hard requirement: persistThread and threadName always travel together, or
+  // the thread is resumable but unidentifiable in `codex resume`.
+  const named = requests.filter((entry) => entry.method === "thread/name/set");
+  assert.equal(named.length, 1, "a persistent review thread must be named");
+  assert.match(named[0].params.name, /Codex Companion Review:/);
+  // A fresh thread gets the plain prompt, with no continuation preamble.
+  const investigate = requests.filter((entry) => entry.method === "turn/start")[0];
+  assert.doesNotMatch(JSON.stringify(investigate.params.input), /<continuation>/);
+});
+
+test("a second adversarial-review --resume reuses the prior thread with a continuation note", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+  const [firstJob] = fixture.readReviewJobs();
+  const priorThreadId = firstJob.threadId;
+  assert.ok(priorThreadId);
+
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  const second = fixture.runReview(["--resume"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const requests = fixture.requests;
+  const resumes = requests.filter((entry) => entry.method === "thread/resume");
+  assert.equal(resumes.length, 1, "the second run must resume rather than start fresh");
+  assert.equal(resumes[0].params.threadId, priorThreadId);
+  assert.ok(!requests.some((entry) => entry.method === "thread/start"), "resuming must not open a new thread");
+  const investigate = requests.filter((entry) => entry.method === "turn/start")[0];
+  assert.match(JSON.stringify(investigate.params.input), /<continuation>/);
+});
+
+test("adversarial-review --fresh ignores the prior thread but stays resumable", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  const second = fixture.runReview(["--fresh"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const requests = fixture.requests;
+  assert.ok(!requests.some((entry) => entry.method === "thread/resume"), "--fresh must not resume");
+  const starts = requests.filter((entry) => entry.method === "thread/start");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].params.ephemeral, false, "--fresh still leaves the new thread resumable");
+  assert.equal(requests.filter((entry) => entry.method === "thread/name/set").length, 1);
+  const investigate = requests.filter((entry) => entry.method === "turn/start")[0];
+  assert.doesNotMatch(JSON.stringify(investigate.params.input), /<continuation>/);
+
+  const jobs = fixture.readReviewJobs();
+  assert.equal(jobs.length, 2);
+  assert.ok(jobs.every((job) => job.resumable === true));
+});
+
+test("--within-hours expires an old thread so --resume starts fresh", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+
+  fixture.ageReviewJobs(5);
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  const second = fixture.runReview(["--resume", "--within-hours", "3"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const requests = fixture.requests;
+  assert.ok(!requests.some((entry) => entry.method === "thread/resume"), "a 5h-old thread is outside a 3h window");
+  assert.equal(requests.filter((entry) => entry.method === "thread/start").length, 1);
+});
+
+test("--resume without --within-hours still applies the default 3h window", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+
+  // Task 7's resolver treats a null window as UNBOUNDED, so a bare --resume
+  // that forgets to pass the default would silently resume a weeks-old thread.
+  fixture.ageReviewJobs(4);
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  const second = fixture.runReview(["--resume"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const requests = fixture.requests;
+  assert.ok(
+    !requests.some((entry) => entry.method === "thread/resume"),
+    "a 4h-old thread must be stale under the implicit 3h default"
+  );
+  assert.equal(requests.filter((entry) => entry.method === "thread/start").length, 1);
+});
+
+test("--within-hours keeps a thread inside a widened window resumable", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+  const priorThreadId = fixture.readReviewJobs()[0].threadId;
+
+  fixture.ageReviewJobs(5);
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  const second = fixture.runReview(["--resume", "--within-hours", "12"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const resumes = fixture.requests.filter((entry) => entry.method === "thread/resume");
+  assert.equal(resumes.length, 1);
+  assert.equal(resumes[0].params.threadId, priorThreadId);
+});
+
+test("adversarial-review with no reuse flags keeps the old ephemeral behavior", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+
+  const result = fixture.runReview([]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const requests = fixture.requests;
+  const starts = requests.filter((entry) => entry.method === "thread/start");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].params.ephemeral, true, "the default review thread stays ephemeral");
+  assert.ok(!requests.some((entry) => entry.method === "thread/name/set"), "default threads stay unnamed");
+  const [job] = fixture.readReviewJobs();
+  assert.ok(!("resumable" in job), "a no-flag review job must not carry a resumable field");
+  const investigate = requests.filter((entry) => entry.method === "turn/start")[0];
+  assert.doesNotMatch(JSON.stringify(investigate.params.input), /<continuation>/);
+});
+
+test("a planned resume that falls back to a fresh thread drops the continuation note", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+  const priorThreadId = fixture.readReviewJobs()[0].threadId;
+  assert.ok(priorThreadId);
+
+  // The job record still points at the thread, but the server no longer has
+  // it. The note must follow the runner's actual `resumed` outcome, not the
+  // planned resumeThreadId — a fresh thread never "already reviewed" anything.
+  fixture.dropThreads();
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  const second = fixture.runReview(["--resume"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const requests = fixture.requests;
+  assert.ok(requests.some((entry) => entry.method === "thread/resume"), "resume was attempted");
+  assert.ok(requests.some((entry) => entry.method === "thread/start"), "fell back to a fresh thread");
+  const investigate = requests.filter((entry) => entry.method === "turn/start")[0];
+  assert.doesNotMatch(JSON.stringify(investigate.params.input), /<continuation>/);
+});
+
+test("a review job is tagged resumable while it is still running, not only once completed", async () => {
+  const fixture = setupResumeReviewRepo();
+  // Hold the first investigation turn open long enough to observe the
+  // in-flight record: the reuse resolver only ever looks at the NEWEST
+  // resumable job, so a tag applied at completion would let a concurrent run
+  // resume the very thread this run is using.
+  fixture.queueSlowFirstTurn(3000);
+
+  const child = spawn(process.execPath, [SCRIPT, "adversarial-review", "--resume"], {
+    cwd: fixture.repo,
+    env: buildEnv(fixture.binDir),
+    stdio: "ignore"
+  });
+
+  try {
+    const running = await waitFor(() => {
+      const job = fixture.readReviewJobs()[0];
+      return job && job.status === "running" ? job : null;
+    }, { timeoutMs: 8000, intervalMs: 50 });
+    assert.equal(running.resumable, true);
+  } finally {
+    await new Promise((resolve) => {
+      child.once("exit", resolve);
+      child.kill("SIGTERM");
+    });
+  }
+});
+
+test("adversarial-review rejects --resume together with --fresh", () => {
+  const fixture = setupResumeReviewRepo();
+
+  const result = fixture.runReview(["--resume", "--fresh"]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--resume and --fresh are mutually exclusive/i);
+});
+
+test("adversarial-review rejects a non-positive --within-hours", () => {
+  const fixture = setupResumeReviewRepo();
+
+  const result = fixture.runReview(["--resume", "--within-hours", "0"]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--within-hours must be a positive number/i);
+});
+
+test("plain review rejects --resume and --fresh", () => {
+  const fixture = setupResumeReviewRepo();
+
+  const resumed = run("node", [SCRIPT, "review", "--resume"], {
+    cwd: fixture.repo,
+    env: buildEnv(fixture.binDir)
+  });
+  assert.notEqual(resumed.status, 0);
+  assert.match(resumed.stderr, /--resume.*adversarial-review|only supported on adversarial-review/i);
+
+  const freshed = run("node", [SCRIPT, "review", "--fresh"], {
+    cwd: fixture.repo,
+    env: buildEnv(fixture.binDir)
+  });
+  assert.notEqual(freshed.status, 0);
+  assert.match(freshed.stderr, /--fresh.*adversarial-review|only supported on adversarial-review/i);
+});

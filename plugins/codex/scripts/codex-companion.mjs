@@ -30,6 +30,11 @@ import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
+  resolveLatestReviewThread,
+  resolveReviewReuseWindowMs,
+  REVIEW_RESUME_CONTINUATION_NOTE
+} from "./lib/review-threads.mjs";
+import {
   generateJobId,
   getConfig,
   listJobs,
@@ -81,7 +86,7 @@ function printUsage() {
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--resume|--fresh] [--within-hours <n>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -518,14 +523,37 @@ async function executeReviewRun(request) {
     }
     const investigatePrompt = buildAdversarialInvestigatePrompt(context, focusText);
     const finalizePrompt = buildAdversarialFinalizePrompt(context, focusText);
+    let resumeThreadId = null;
+    if (request.resume) {
+      const prior = resolveLatestReviewThread(resolveWorkspaceRoot(context.repoRoot), {
+        // `null` means unbounded in the resolver, so the default window has to
+        // be passed explicitly — a bare --resume must never reuse a
+        // weeks-old thread.
+        withinMs: request.reuseWindowMs ?? resolveReviewReuseWindowMs(),
+        excludeJobId: request.jobId ?? null,
+        kind: "adversarial-review"
+      });
+      if (prior) {
+        resumeThreadId = prior.id;
+      }
+    }
     result = await runAppServerInvestigation(context.repoRoot, {
-      investigatePrompt,
+      // The continuation note is gated on the runner's `resumed` flag, not on
+      // resumeThreadId: a pruned thread falls back to a fresh one, and telling
+      // that thread it already reviewed this worktree would be a lie.
+      buildInvestigatePrompt: ({ resumed }) =>
+        resumed ? `${REVIEW_RESUME_CONTINUATION_NOTE}\n\n${investigatePrompt}` : investigatePrompt,
       finalizePrompt,
       outputSchema: readOutputSchema(REVIEW_SCHEMA),
       model: request.model,
       sandbox: "read-only",
       maxInvestigationTurns: request.maxInvestigationTurns,
       turnIdleTimeoutMs: request.turnIdleTimeoutMs,
+      resumeThreadId,
+      // persistThread and threadName always travel together: a persistent but
+      // unnamed thread is resumable yet unidentifiable in `codex resume`.
+      persistThread: Boolean(request.sessionMode),
+      threadName: request.sessionMode ? `Codex Companion Review: ${target.label}` : null,
       onProgress: request.onProgress
     });
   } else {
@@ -743,7 +771,7 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, resumable = false }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -752,7 +780,13 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    // Tagged at creation, not at completion: the reuse resolver only considers
+    // the newest resumable job, so a run must be visible as a reuse candidate
+    // while it is still in flight or two concurrent runs would resume the same
+    // thread. Omitted entirely when false, keeping no-flag job records
+    // byte-identical to before.
+    ...(resumable ? { resumable: true } : {})
   });
 }
 
@@ -890,8 +924,16 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd", "max-investigation-turns", "turn-idle-timeout"],
-    booleanOptions: ["json", "background", "wait"],
+    valueOptions: [
+      "base",
+      "scope",
+      "model",
+      "cwd",
+      "max-investigation-turns",
+      "turn-idle-timeout",
+      "within-hours"
+    ],
+    booleanOptions: ["json", "background", "wait", "resume", "fresh"],
     aliasMap: {
       m: "model"
     }
@@ -919,6 +961,29 @@ async function handleReviewCommand(argv, config) {
   // long-thinking task is not aborted; it passes no timeout to runAppServerTurn.
   const turnIdleTimeoutMs = resolveReviewTurnIdleTimeoutMs(explicitIdleTimeoutMs);
 
+  const resume = Boolean(options.resume);
+  const fresh = Boolean(options.fresh);
+  if (resume && fresh) {
+    throw new Error("--resume and --fresh are mutually exclusive.");
+  }
+  // Both flags mean "keep this thread around", so either one opts into session
+  // mode; only --resume also looks for a thread to continue.
+  const sessionMode = resume || fresh;
+  if (sessionMode && config.reviewName !== "Adversarial Review") {
+    throw new Error("--resume/--fresh are only supported on adversarial-review.");
+  }
+  let reuseWindowMs = null;
+  if (options["within-hours"] !== undefined) {
+    if (!resume) {
+      throw new Error("--within-hours only applies to --resume.");
+    }
+    const parsed = Number(options["within-hours"]);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error(`--within-hours must be a positive number (got: ${options["within-hours"]})`);
+    }
+    reuseWindowMs = resolveReviewReuseWindowMs(parsed);
+  }
+
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
@@ -935,7 +1000,8 @@ async function handleReviewCommand(argv, config) {
     title: metadata.title,
     workspaceRoot,
     jobClass: "review",
-    summary: metadata.summary
+    summary: metadata.summary,
+    resumable: sessionMode
   });
   await runForegroundCommand(
     job,
@@ -949,6 +1015,10 @@ async function handleReviewCommand(argv, config) {
         reviewName: config.reviewName,
         maxInvestigationTurns,
         turnIdleTimeoutMs,
+        resume,
+        sessionMode,
+        reuseWindowMs,
+        jobId: job.id,
         onProgress: progress
       }),
     { json: options.json }

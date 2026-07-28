@@ -1,6 +1,6 @@
 ---
 description: Run a Codex review that challenges the implementation approach and design choices
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-investigation-turns N] [--turn-idle-timeout SECONDS] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-investigation-turns N] [--turn-idle-timeout SECONDS] [--resume|--fresh] [--within-hours <n>] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -46,7 +46,14 @@ Argument handling:
 - For very large diffs that exceed the inline threshold, Codex investigates the diff with read-only commands across multiple turns. Use `--max-investigation-turns N` (default 10) to raise or lower the cap.
 - If a turn stalls with no output for `--turn-idle-timeout SECONDS` (default 1200), the run aborts gracefully with a clear failure instead of hanging. Lower it to fail faster on a flaky connection; raise it for very slow turns.
 - There is ALSO an absolute per-turn ceiling (default 7200s) with no CLI flag — override with the `CODEX_COMPANION_TURN_TIMEOUT_MS` env var. The multi-turn stall watchdog defaults to 1200s (`CODEX_COMPANION_TURN_STALL_MS`). Defaults are sized for slow reasoning backends (Bedrock gpt-5.6 xhigh); most runs need no overrides.
-- If a run failed with "exceeded the …s ceiling", raise `CODEX_COMPANION_TURN_TIMEOUT_MS`; if it failed with "Turn idle" or "no activity", raise `--turn-idle-timeout` (reviews pass it explicitly, so it wins over `CODEX_COMPANION_TURN_STALL_MS` on this path). A retry starts a fresh thread — it cannot reuse the failed run's findings.
+- If a run failed with "exceeded the …s ceiling", raise `CODEX_COMPANION_TURN_TIMEOUT_MS`; if it failed with "Turn idle" or "no activity", raise `--turn-idle-timeout` (reviews pass it explicitly, so it wins over `CODEX_COMPANION_TURN_STALL_MS` on this path). By default a retry starts a fresh thread and cannot reuse the failed run's findings — but see `--resume` below, which makes a retry pick up a prior *successful* run's context. A failed run is never reused.
+
+Context reuse (faster re-reviews):
+- `--resume` reuses-or-creates: it reuses this git worktree's recent adversarial review thread if one exists, otherwise starts a new resumable thread. Safe to pass on every review; it never fails just because no prior thread exists.
+- Reuse keeps the exploration Codex already did, so a review → fix → re-review loop skips the cold re-investigation. The current diff is still collected fresh on every pass.
+- Reuse is scoped to this worktree and bounded by recency (default 3h; override with `--within-hours <n>`).
+- `--fresh` forces a new resumable thread, discarding prior context.
+- Pass the flags through verbatim; do not treat them as focus text.
 
 Foreground flow:
 - Run:
