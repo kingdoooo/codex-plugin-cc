@@ -19,6 +19,11 @@ export function resolveReviewReuseWindowMs(hours) {
   return parsed * 60 * 60 * 1000;
 }
 
+function resolveFiniteWindowMs(withinMs) {
+  const parsed = Number(withinMs);
+  return Number.isFinite(parsed) ? parsed : resolveReviewReuseWindowMs();
+}
+
 // Reuse is keyed by git worktree (the per-worktree state dir already scopes
 // jobs) and bounded by recency. Only the NEWEST resumable review job is
 // considered — even before it records a thread id — otherwise two concurrent
@@ -38,9 +43,16 @@ export function resolveLatestReviewThread(
   if (!candidate || candidate.status !== "completed" || !candidate.threadId) {
     return null;
   }
-  if (Number.isFinite(withinMs)) {
+  // withinMs arrives from CLI flags and env vars as a string, and
+  // Number.isFinite does not coerce — guarding on it directly would let
+  // "10800000" skip the recency check entirely. null/undefined still means "no
+  // window"; anything else that fails to coerce falls back to the default
+  // window, so a caller that asked for a bound never silently gets unbounded
+  // reuse.
+  const windowMs = withinMs == null ? null : resolveFiniteWindowMs(withinMs);
+  if (windowMs !== null) {
     const lastUsed = Date.parse(candidate.completedAt ?? candidate.createdAt ?? "");
-    if (!Number.isFinite(lastUsed) || Date.now() - lastUsed > withinMs) {
+    if (!Number.isFinite(lastUsed) || Date.now() - lastUsed > windowMs) {
       return null;
     }
   }

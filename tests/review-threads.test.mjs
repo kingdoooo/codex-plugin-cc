@@ -80,6 +80,53 @@ test("recency window: an expired thread is not reused", () => {
   assert.equal(resolveLatestReviewThread(ws, { kind: "adversarial-review", withinMs: 3 * 3600_000 }), null);
 });
 
+// CLI flags and env vars arrive as strings, so a numeric-string window must
+// bind as tightly as the equivalent number. Number.isFinite does not coerce,
+// so guarding on it directly would skip the whole recency check.
+test("recency window: a numeric-string withinMs still expires a stale thread", () => {
+  const ws = makeTempDir("rt-");
+  seedJob(ws, { id: "review-stale-str", touchedAt: new Date(Date.now() - 4 * 3600_000).toISOString() });
+
+  assert.equal(resolveLatestReviewThread(ws, { kind: "adversarial-review", withinMs: "10800000" }), null);
+});
+
+test("recency window: a numeric-string withinMs still admits a fresh thread", () => {
+  const ws = makeTempDir("rt-");
+  seedJob(ws, { id: "review-fresh-str", threadId: "t-fresh", touchedAt: new Date(Date.now() - 3600_000).toISOString() });
+
+  assert.equal(resolveLatestReviewThread(ws, { kind: "adversarial-review", withinMs: "10800000" })?.id, "t-fresh");
+});
+
+// Proves the string is read as a number rather than blanket-rejected: 2ms is a
+// real bound that a 30s-old thread fails.
+test("recency window: a numeric-string withinMs is compared as a number", () => {
+  const ws = makeTempDir("rt-");
+  seedJob(ws, { id: "review-tiny-window" });
+
+  assert.equal(resolveLatestReviewThread(ws, { kind: "adversarial-review", withinMs: "2" }), null);
+});
+
+// Fail closed: asking for a bound and supplying garbage must not silently buy
+// unbounded reuse, so the default window applies instead.
+test("recency window: an uncoercible withinMs falls back to the default 3h window", () => {
+  const staleWs = makeTempDir("rt-");
+  seedJob(staleWs, { id: "review-stale-nan", touchedAt: new Date(Date.now() - 4 * 3600_000).toISOString() });
+  assert.equal(resolveLatestReviewThread(staleWs, { kind: "adversarial-review", withinMs: "abc" }), null);
+
+  const freshWs = makeTempDir("rt-");
+  seedJob(freshWs, { id: "review-fresh-nan", threadId: "t-nan", touchedAt: new Date(Date.now() - 3600_000).toISOString() });
+  assert.equal(resolveLatestReviewThread(freshWs, { kind: "adversarial-review", withinMs: "abc" })?.id, "t-nan");
+});
+
+// Preserves the #375 signature: absent window means no recency bound at all.
+test("recency window: null withinMs leaves reuse unbounded", () => {
+  const ws = makeTempDir("rt-");
+  seedJob(ws, { id: "review-ancient", threadId: "t-ancient", touchedAt: new Date(Date.now() - 90 * 24 * 3600_000).toISOString() });
+
+  assert.equal(resolveLatestReviewThread(ws, { kind: "adversarial-review", withinMs: null })?.id, "t-ancient");
+  assert.equal(resolveLatestReviewThread(ws, { kind: "adversarial-review" })?.id, "t-ancient");
+});
+
 test("non-resumable jobs are ignored", () => {
   const ws = makeTempDir("rt-");
   seedJob(ws, { id: "review-eph", resumable: false });
