@@ -45,8 +45,8 @@ Argument handling:
 - Unlike `/codex:review`, it can still take extra focus text after the flags.
 - For very large diffs that exceed the inline threshold, Codex investigates the diff with read-only commands across multiple turns. Use `--max-investigation-turns N` (default 10) to raise or lower the cap.
 - If a turn stalls with no output for `--turn-idle-timeout SECONDS` (default 1200), the run aborts gracefully with a clear failure instead of hanging. Lower it to fail faster on a flaky connection; raise it for very slow turns.
-- There is ALSO an absolute per-turn ceiling (default 1800s) with no CLI flag — set the `CODEX_COMPANION_TURN_TIMEOUT_MS` env var on the command. A healthy long turn (slow reasoning models, e.g. gpt-5.5 xhigh) can exceed 1800s with zero idle time, so raising only `--turn-idle-timeout` does not protect it. For slow backends prefix the command: `CODEX_COMPANION_TURN_TIMEOUT_MS=3600000 node ... adversarial-review ...`.
-- If a previous run failed with "exceeded the …s ceiling", the retry MUST set `CODEX_COMPANION_TURN_TIMEOUT_MS` higher; if it failed with "Turn idle", raise `--turn-idle-timeout`. When unsure, raise both. A retry starts a fresh thread — it cannot reuse the failed run's findings.
+- There is ALSO an absolute per-turn ceiling (default 7200s) with no CLI flag — override with the `CODEX_COMPANION_TURN_TIMEOUT_MS` env var. The multi-turn stall watchdog defaults to 1200s (`CODEX_COMPANION_TURN_STALL_MS`). Defaults are sized for slow reasoning backends (Bedrock gpt-5.6 xhigh); most runs need no overrides.
+- If a run failed with "exceeded the …s ceiling", raise `CODEX_COMPANION_TURN_TIMEOUT_MS`; if it failed with "Turn idle" or "no activity", raise `--turn-idle-timeout` (reviews pass it explicitly, so it wins over `CODEX_COMPANION_TURN_STALL_MS` on this path). A retry starts a fresh thread — it cannot reuse the failed run's findings.
 
 Foreground flow:
 - Run:

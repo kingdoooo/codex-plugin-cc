@@ -66,22 +66,26 @@ const DEFAULT_CONTINUE_PROMPT =
 // runners pass whatever they are given straight through to captureTurn. When
 // no explicit value is supplied, captureTurn falls back to the always-on stall
 // default below (env-tunable), so task runs are still bounded.
-// Measured 2026-07-27: healthy Bedrock gpt-5.6 xhigh turns go silent for well
-// over 600s while reasoning; 180s killed them routinely. This review default is
-// therefore LOOSER than DEFAULT_TURN_STALL_MS, not tighter.
+// Measured 2026-07-27 against Bedrock gpt-5.6 xhigh: healthy turns go silent for
+// well over 600s while reasoning (180s killed them routinely), and one healthy
+// turn ran past 3600s end to end. That single measurement sizes all three turn
+// defaults in this file — this review window plus DEFAULT_TURN_STALL_MS and
+// DEFAULT_TURN_CEILING_MS below — so keep them in step when it is re-measured.
 const DEFAULT_TURN_IDLE_TIMEOUT_MS = 1_200_000;
 
 // Always-on turn guards (from upstream PR #361). Every captureTurn is bounded
 // three ways so a wedged turn fails toward "didn't finish" instead of hanging:
 //   - stall:   no BELONGING traffic for this long => stalled. Review callers
-//     pass an explicit turnIdleTimeoutMs (looser, since reasoning backends go
-//     silent for long stretches); everything else gets this default,
-//     overridable via CODEX_COMPANION_TURN_STALL_MS.
+//     pass an explicit turnIdleTimeoutMs, which wins outright; everything else
+//     gets this default, overridable via CODEX_COMPANION_TURN_STALL_MS.
 //   - ceiling: absolute backstop on a single turn's total duration,
-//     overridable via CODEX_COMPANION_TURN_TIMEOUT_MS.
+//     overridable via CODEX_COMPANION_TURN_TIMEOUT_MS. It bounds a turn that
+//     keeps trickling traffic, so it must clear the longest healthy turn — not
+//     just the longest healthy silence the stall window covers.
 //   - exit:    app-server process death rejects immediately.
-const DEFAULT_TURN_STALL_MS = 600_000;
-const DEFAULT_TURN_CEILING_MS = 1_800_000;
+// Both are sized from the same slow-backend measurement noted above.
+const DEFAULT_TURN_STALL_MS = 1_200_000;
+const DEFAULT_TURN_CEILING_MS = 7_200_000;
 
 // Demoted-inference quiet window (Defect A). Inferred turn completion is a
 // FALLBACK for the subagent/collab case where the main thread never emits a
@@ -114,7 +118,7 @@ export function resolveReviewTurnIdleTimeoutMs(explicitMs) {
   return Number.isFinite(explicitMs) && explicitMs > 0 ? explicitMs : DEFAULT_TURN_IDLE_TIMEOUT_MS;
 }
 
-function resolveTurnStallMs(explicitMs) {
+export function resolveTurnStallMs(explicitMs) {
   if (Number.isFinite(explicitMs) && explicitMs > 0) {
     return explicitMs;
   }
@@ -125,7 +129,7 @@ function resolveTurnStallMs(explicitMs) {
   return DEFAULT_TURN_STALL_MS;
 }
 
-function resolveTurnCeilingMs() {
+export function resolveTurnCeilingMs() {
   const fromEnv = Number(process.env.CODEX_COMPANION_TURN_TIMEOUT_MS);
   if (Number.isFinite(fromEnv) && fromEnv > 0) {
     return fromEnv;
@@ -703,6 +707,14 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   // chatter must not mask a stuck turn). Review callers pass an explicit
   // window; everything else gets the always-on default.
   const stallMs = resolveTurnStallMs(options.turnIdleTimeoutMs);
+  // Name only the knob that governs THIS path. An explicit review window beats
+  // CODEX_COMPANION_TURN_STALL_MS, so telling a review caller to raise the env
+  // var would point at an inert setting; conversely the task path has no
+  // --turn-idle-timeout flag to raise.
+  const stallKnob =
+    Number.isFinite(options.turnIdleTimeoutMs) && options.turnIdleTimeoutMs > 0
+      ? "--turn-idle-timeout"
+      : "CODEX_COMPANION_TURN_STALL_MS";
   let idleTimer = null;
   let idleReject = null;
   let settled = false;
@@ -722,7 +734,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       idleReject?.(
         Object.assign(
           new Error(
-            `Turn idle: no activity for ${seconds}s; aborting (stalled turn or upstream connection — raise CODEX_COMPANION_TURN_STALL_MS or --turn-idle-timeout for long silent turns).`
+            `Turn idle: no activity for ${seconds}s; aborting (stalled turn or upstream connection — raise ${stallKnob} for long silent turns).`
           ),
           { turnAbandoned: true }
         )

@@ -2,7 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { setupFakeCodex } from "./fake-codex-fixture.mjs";
-import { resolveReviewTurnIdleTimeoutMs, resolveRunExitStatus, runAppServerTurn } from "../plugins/codex/scripts/lib/codex.mjs";
+import {
+  resolveReviewTurnIdleTimeoutMs,
+  resolveRunExitStatus,
+  resolveTurnCeilingMs,
+  resolveTurnStallMs,
+  runAppServerTurn
+} from "../plugins/codex/scripts/lib/codex.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 test("resolveReviewTurnIdleTimeoutMs defaults the review watchdog and honors explicit values", () => {
@@ -15,6 +21,41 @@ test("resolveReviewTurnIdleTimeoutMs defaults the review watchdog and honors exp
   assert.equal(resolveReviewTurnIdleTimeoutMs(null), 1_200_000, "null falls back to the review default");
   assert.equal(resolveReviewTurnIdleTimeoutMs(300), 300, "explicit ms passes through");
   assert.equal(resolveReviewTurnIdleTimeoutMs(0), 1_200_000, "zero/invalid falls back to the review default");
+});
+
+test("always-on turn guards default to the slow-backend stall/ceiling windows", (t) => {
+  // These are the guards every captureTurn gets, including /codex:task. They are
+  // sized for reasoning backends that go silent for long stretches; too-tight
+  // values kill healthy turns. Env overrides are read at call time, so clear any
+  // ambient values the outer shell may have set.
+  const previousStall = process.env.CODEX_COMPANION_TURN_STALL_MS;
+  const previousCeiling = process.env.CODEX_COMPANION_TURN_TIMEOUT_MS;
+  delete process.env.CODEX_COMPANION_TURN_STALL_MS;
+  delete process.env.CODEX_COMPANION_TURN_TIMEOUT_MS;
+  t.after(() => {
+    if (previousStall === undefined) {
+      delete process.env.CODEX_COMPANION_TURN_STALL_MS;
+    } else {
+      process.env.CODEX_COMPANION_TURN_STALL_MS = previousStall;
+    }
+    if (previousCeiling === undefined) {
+      delete process.env.CODEX_COMPANION_TURN_TIMEOUT_MS;
+    } else {
+      process.env.CODEX_COMPANION_TURN_TIMEOUT_MS = previousCeiling;
+    }
+  });
+
+  assert.equal(resolveTurnStallMs(undefined), 1_200_000, "stall default is 1200s");
+  assert.equal(resolveTurnCeilingMs(), 7_200_000, "ceiling default is 7200s");
+
+  // An explicit review window still wins over the stall default, and the env
+  // overrides the tests and docs advertise must keep working.
+  assert.equal(resolveTurnStallMs(300), 300, "explicit review window passes through");
+  process.env.CODEX_COMPANION_TURN_STALL_MS = "500";
+  process.env.CODEX_COMPANION_TURN_TIMEOUT_MS = "900";
+  assert.equal(resolveTurnStallMs(undefined), 500, "CODEX_COMPANION_TURN_STALL_MS overrides the default");
+  assert.equal(resolveTurnCeilingMs(), 900, "CODEX_COMPANION_TURN_TIMEOUT_MS overrides the default");
+  assert.equal(resolveTurnStallMs(300), 300, "an explicit review window still beats the env override");
 });
 
 test("runAppServerTurn passes through an absent idle timeout (task path arms no watchdog)", async () => {
