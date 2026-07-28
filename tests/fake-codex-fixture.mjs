@@ -29,6 +29,17 @@ function saveState(state) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
 }
 
+// Thread-lifecycle RPCs are recorded alongside turn/start so queue-driven
+// tests can assert on thread creation/resume shape, not just turn payloads.
+function recordRequest(state, message) {
+  if (BEHAVIOR !== "queue-driven") {
+    return;
+  }
+  if (!state.requests) { state.requests = []; }
+  state.requests.push({ method: message.method, params: message.params });
+  saveState(state);
+}
+
 function requiresExperimental(field, message, state) {
   if (!(field in (message.params || {}))) {
     return false;
@@ -307,6 +318,7 @@ rl.on("line", (line) => {
         break;
 
       case "thread/start": {
+        recordRequest(state, message);
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
         }
@@ -320,6 +332,7 @@ rl.on("line", (line) => {
       }
 
       case "thread/name/set": {
+        recordRequest(state, message);
         const thread = ensureThread(state, message.params.threadId);
         thread.name = message.params.name;
         thread.updatedAt = now();
@@ -342,6 +355,7 @@ rl.on("line", (line) => {
       }
 
       case "thread/resume": {
+        recordRequest(state, message);
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }

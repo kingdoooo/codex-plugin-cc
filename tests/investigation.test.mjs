@@ -1869,3 +1869,116 @@ test("finalize effort is resolved per call, not cached at import time", async ()
     fake2.close();
   }
 });
+
+// -------------------------------------------------------------------
+// Task 8: resumable persistent threads (#375/#557 port)
+// -------------------------------------------------------------------
+
+test("investigation resumes a prior thread and marks the prompt as resumed", async () => {
+  const cwd = makeTempDir("codex-inv-resume-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // First run: session mode, so the thread survives for the next run.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    const first = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      persistThread: true,
+      threadName: "Codex Companion Review: test"
+    });
+    assert.ok(first.threadId);
+    const firstStart = fake.requests.find((r) => r.method === "thread/start");
+    assert.equal(firstStart.params.ephemeral, false, "session mode threads persist");
+    const named = fake.requests.filter((r) => r.method === "thread/name/set");
+    assert.equal(named.length, 1);
+    assert.equal(named[0].params.name, "Codex Companion Review: test");
+
+    // Second run: resume the same thread.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done again." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    const second = await runAppServerInvestigation(fake.cwd, {
+      buildInvestigatePrompt: ({ resumed }) =>
+        resumed ? "<continuation>resumed</continuation> Investigate." : "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      resumeThreadId: first.threadId,
+      persistThread: true
+    });
+    assert.equal(second.threadId, first.threadId);
+    const resumes = fake.requests.filter((r) => r.method === "thread/resume");
+    assert.equal(resumes.length, 1);
+    assert.equal(resumes[0].params.threadId, first.threadId);
+    // Resuming must not create a second thread.
+    assert.equal(fake.requests.filter((r) => r.method === "thread/start").length, 1);
+    const secondInvestigate = fake.requests.filter((r) => r.method === "turn/start").at(-2);
+    assert.match(JSON.stringify(secondInvestigate.params.input), /<continuation>resumed<\/continuation>/);
+  } finally {
+    fake.close();
+  }
+});
+
+test("resume failure falls back to a fresh thread instead of failing the run", async () => {
+  const cwd = makeTempDir("codex-inv-resume-fb-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    const result = await runAppServerInvestigation(fake.cwd, {
+      buildInvestigatePrompt: ({ resumed }) => (resumed ? "RESUMED" : "FRESH"),
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      resumeThreadId: "thread-that-was-pruned",
+      persistThread: true
+    });
+    assert.equal(result.status, 0);
+    assert.ok(fake.requests.some((r) => r.method === "thread/resume"), "resume was attempted");
+    assert.ok(fake.requests.some((r) => r.method === "thread/start"), "fell back to a fresh thread");
+    const investigate = fake.requests.filter((r) => r.method === "turn/start")[0];
+    assert.match(JSON.stringify(investigate.params.input), /FRESH/);
+  } finally {
+    fake.close();
+  }
+});
+
+test("no-flag path still starts an ephemeral unnamed thread", async () => {
+  const cwd = makeTempDir("codex-inv-eph-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] }
+    });
+    const start = fake.requests.find((r) => r.method === "thread/start");
+    assert.equal(start.params.ephemeral, true);
+    assert.ok(!fake.requests.some((r) => r.method === "thread/name/set"));
+    assert.ok(!fake.requests.some((r) => r.method === "thread/resume"));
+  } finally {
+    fake.close();
+  }
+});
+
+test("investigation requires an investigate prompt from one of the two option shapes", async () => {
+  const cwd = makeTempDir("codex-inv-noprompt-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    await assert.rejects(
+      () => runAppServerInvestigation(fake.cwd, { finalizePrompt: "Finalize." }),
+      /investigate prompt|investigatePrompt/
+    );
+    // A builder that returns nothing usable is rejected too.
+    await assert.rejects(
+      () => runAppServerInvestigation(fake.cwd, {
+        finalizePrompt: "Finalize.",
+        buildInvestigatePrompt: () => "   "
+      }),
+      /investigate prompt/
+    );
+  } finally {
+    fake.close();
+  }
+});

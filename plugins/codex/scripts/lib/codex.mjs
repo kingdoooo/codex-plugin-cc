@@ -1471,7 +1471,12 @@ export async function runAppServerInvestigation(cwd, options = {}) {
 
   const investigatePrompt = options.investigatePrompt?.trim();
   const finalizePrompt = options.finalizePrompt?.trim();
-  if (!investigatePrompt) {
+  // buildInvestigatePrompt needs the resumed flag, which is only known after
+  // the thread is opened, so the turn-1 prompt is validated after resolution.
+  const buildInvestigatePrompt = typeof options.buildInvestigatePrompt === "function"
+    ? options.buildInvestigatePrompt
+    : null;
+  if (!investigatePrompt && !buildInvestigatePrompt) {
     throw new Error("runAppServerInvestigation requires investigatePrompt.");
   }
   if (!finalizePrompt) {
@@ -1487,15 +1492,49 @@ export async function runAppServerInvestigation(cwd, options = {}) {
   const sandbox = options.sandbox ?? "read-only";
 
   return withAppServer(cwd, async (client) => {
-    emitProgress(options.onProgress, "Starting Codex investigation thread.", "starting");
-    const startResponse = await startThread(client, cwd, {
-      model: options.model,
-      sandbox,
-      ephemeral: true,
-      threadName: null
-    });
-    const threadId = startResponse.thread.id;
+    let threadId;
+    let resumedThread = false;
+    const startFreshThread = async () => {
+      emitProgress(options.onProgress, "Starting Codex investigation thread.", "starting");
+      const response = await startThread(client, cwd, {
+        model: options.model,
+        sandbox,
+        // Session mode (persistThread) keeps the thread resumable across runs
+        // and broker restarts; the default stays ephemeral and unnamed.
+        ephemeral: options.persistThread ? false : true,
+        threadName: options.persistThread ? options.threadName ?? null : null
+      });
+      return response.thread.id;
+    };
+
+    if (options.resumeThreadId) {
+      emitProgress(options.onProgress, `Resuming review thread ${options.resumeThreadId}.`, "starting");
+      try {
+        const response = await resumeThread(client, options.resumeThreadId, cwd, {
+          model: options.model,
+          sandbox,
+          ephemeral: false
+        });
+        threadId = response.thread.id;
+        resumedThread = true;
+      } catch {
+        // A persisted thread can be pruned or expired by Codex. Resume fails
+        // before any turn starts, so no tokens are wasted — fall back to a
+        // fresh thread rather than failing the whole run.
+        emitProgress(options.onProgress, `Could not resume thread ${options.resumeThreadId}; starting fresh.`, "starting");
+        threadId = await startFreshThread();
+      }
+    } else {
+      threadId = await startFreshThread();
+    }
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", { threadId });
+
+    const effectiveInvestigatePrompt = buildInvestigatePrompt
+      ? String(buildInvestigatePrompt({ resumed: resumedThread }) ?? "").trim()
+      : investigatePrompt;
+    if (!effectiveInvestigatePrompt) {
+      throw new Error("runAppServerInvestigation requires a non-empty investigate prompt.");
+    }
 
     let turnCount = 0;
     let truncated = false;
@@ -1505,7 +1544,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
     const investigationMessages = [];
 
     for (let i = 1; i <= maxInvestigationTurns; i += 1) {
-      const promptText = i === 1 ? investigatePrompt : INVESTIGATION_CONTINUATION_CUE;
+      const promptText = i === 1 ? effectiveInvestigatePrompt : INVESTIGATION_CONTINUATION_CUE;
       emitProgress(options.onProgress, `Investigation turn ${i}.`, "investigating");
 
       let turnState;
