@@ -1333,6 +1333,23 @@ export async function runAppServerTurn(cwd, options = {}) {
 const DEFAULT_MAX_INVESTIGATION_TURNS = 10;
 const INVESTIGATION_CONTINUATION_CUE = "Continue your investigation.";
 
+const DEFAULT_FINALIZE_EFFORT = "medium";
+const FINALIZE_EFFORT_VALUES = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
+// The finalize turn translates already-formed conclusions into schema JSON —
+// mechanical work that does not benefit from a reasoning-heavy effort. Read at
+// call time (not import time) so the env override always takes effect.
+function resolveFinalizeEffort(callerEffort) {
+  const raw = String(process.env.CODEX_COMPANION_FINALIZE_EFFORT ?? "").trim().toLowerCase();
+  if (raw === "inherit") {
+    return callerEffort ?? null;
+  }
+  if (FINALIZE_EFFORT_VALUES.has(raw)) {
+    return raw;
+  }
+  return DEFAULT_FINALIZE_EFFORT;
+}
+
 export async function runAppServerInvestigation(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1494,7 +1511,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
               threadId,
               input: buildTurnInput(promptText),
               model: options.model ?? null,
-              effort: options.effort ?? null,
+              effort: resolveFinalizeEffort(options.effort ?? null),
               outputSchema: options.outputSchema ?? null
             }),
           { onProgress: options.onProgress, turnIdleTimeoutMs, inferredCompletionQuietMs }
