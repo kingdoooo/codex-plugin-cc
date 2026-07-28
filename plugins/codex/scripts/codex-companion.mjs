@@ -514,6 +514,30 @@ async function executeReviewRun(request) {
     };
   }
 
+  // Resolved for BOTH review branches. The inline (single-shot) branch is not
+  // exempt from session mode: it records the same resumable job with the same
+  // threadId, so if it opened an ephemeral thread instead of joining the
+  // lineage, one small single-file review mid-loop would strand all the
+  // accumulated context behind an id nothing can resume (the resolver only
+  // ever considers the newest resumable job).
+  let resumeThreadId = null;
+  if (request.resume) {
+    const prior = resolveLatestReviewThread(resolveWorkspaceRoot(context.repoRoot), {
+      // `null` means unbounded in the resolver, so the default window has to
+      // be passed explicitly — a bare --resume must never reuse a
+      // weeks-old thread.
+      withinMs: request.reuseWindowMs ?? resolveReviewReuseWindowMs(),
+      excludeJobId: request.jobId ?? null,
+      kind: "adversarial-review"
+    });
+    if (prior) {
+      resumeThreadId = prior.id;
+    }
+  }
+  const sessionThreadName = request.sessionMode
+    ? `Codex Companion Review: ${target.label}`
+    : null;
+
   let result;
   if (context.inputMode === "self-collect") {
     if (!context.investigationInline) {
@@ -523,20 +547,6 @@ async function executeReviewRun(request) {
     }
     const investigatePrompt = buildAdversarialInvestigatePrompt(context, focusText);
     const finalizePrompt = buildAdversarialFinalizePrompt(context, focusText);
-    let resumeThreadId = null;
-    if (request.resume) {
-      const prior = resolveLatestReviewThread(resolveWorkspaceRoot(context.repoRoot), {
-        // `null` means unbounded in the resolver, so the default window has to
-        // be passed explicitly — a bare --resume must never reuse a
-        // weeks-old thread.
-        withinMs: request.reuseWindowMs ?? resolveReviewReuseWindowMs(),
-        excludeJobId: request.jobId ?? null,
-        kind: "adversarial-review"
-      });
-      if (prior) {
-        resumeThreadId = prior.id;
-      }
-    }
     result = await runAppServerInvestigation(context.repoRoot, {
       // The continuation note is gated on the runner's `resumed` flag, not on
       // resumeThreadId: a pruned thread falls back to a fresh one, and telling
@@ -553,19 +563,55 @@ async function executeReviewRun(request) {
       // persistThread and threadName always travel together: a persistent but
       // unnamed thread is resumable yet unidentifiable in `codex resume`.
       persistThread: Boolean(request.sessionMode),
-      threadName: request.sessionMode ? `Codex Companion Review: ${target.label}` : null,
+      threadName: sessionThreadName,
       onProgress: request.onProgress
     });
   } else {
     const prompt = buildAdversarialReviewPrompt(context, focusText);
-    result = await runAppServerTurn(context.repoRoot, {
-      prompt,
-      model: request.model,
-      sandbox: "read-only",
-      outputSchema: readOutputSchema(REVIEW_SCHEMA),
-      turnIdleTimeoutMs: request.turnIdleTimeoutMs,
-      onProgress: request.onProgress
-    });
+    // A resume failure has to be distinguished from a failure of the turn that
+    // follows it. runAppServerTurn announces the opened thread with a
+    // threadId-bearing progress event only AFTER thread/resume returns, so
+    // "no thread was ever announced" means resume itself failed and retrying
+    // costs nothing. Once the thread is open the turn may already have been
+    // billed, and re-running it on a fresh thread would double-spend.
+    let inlineThreadOpened = false;
+    const trackInlineProgress = (event) => {
+      if (event && typeof event === "object" && event.threadId) {
+        inlineThreadOpened = true;
+      }
+      request.onProgress?.(event);
+    };
+    const runInlineReview = (threadId) =>
+      runAppServerTurn(context.repoRoot, {
+        prompt,
+        model: request.model,
+        sandbox: "read-only",
+        outputSchema: readOutputSchema(REVIEW_SCHEMA),
+        turnIdleTimeoutMs: request.turnIdleTimeoutMs,
+        resumeThreadId: threadId,
+        persistThread: Boolean(request.sessionMode),
+        threadName: sessionThreadName,
+        onProgress: trackInlineProgress
+      });
+    if (resumeThreadId) {
+      try {
+        result = await runInlineReview(resumeThreadId);
+      } catch (error) {
+        // Unlike runAppServerInvestigation, runAppServerTurn does not fall back
+        // to a fresh thread when thread/resume fails, so the review caller has
+        // to. A pruned or expired thread must cost a cold re-investigation, not
+        // the whole review.
+        if (inlineThreadOpened) {
+          throw error;
+        }
+        request.onProgress?.(
+          `Could not resume review thread ${resumeThreadId}; starting fresh.`
+        );
+        result = await runInlineReview(null);
+      }
+    } else {
+      result = await runInlineReview(null);
+    }
   }
   // Parse first, then decide. A run can carry a non-zero status / error from a
   // transient reconnect yet still have produced valid structured output (the

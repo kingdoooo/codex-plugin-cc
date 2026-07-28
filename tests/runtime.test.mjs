@@ -2632,6 +2632,35 @@ function setupResumeReviewRepo() {
       const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
       return state.jobs.filter((job) => job.jobClass === "review");
     },
+    // Collapses the working tree to a SINGLE changed file, which routes the
+    // next review through the single-shot inline-diff branch
+    // (DEFAULT_INLINE_DIFF_MAX_FILES is 1) instead of self-collect.
+    shrinkToInlineDiff() {
+      for (const name of ["b.js", "c.js"]) {
+        fs.writeFileSync(path.join(repo, "src", name), `export const value = "${name}-v1";\n`);
+      }
+      fs.writeFileSync(path.join(repo, "src", "a.js"), 'export const value = "a.js-inline";\n');
+    },
+    // Restores the three-file working tree so the review routes back through
+    // the multi-turn self-collect branch.
+    growToSelfCollect(marker) {
+      for (const name of ["a.js", "b.js", "c.js"]) {
+        fs.writeFileSync(path.join(repo, "src", name), `export const value = "${name}-${marker}";\n`);
+      }
+    },
+    // The inline branch is a single schema-pinned turn, not recon + finalize.
+    queueOneInlineReview() {
+      const state = readFakeState();
+      state.queue.push({ finalAnswer: { text: RESUME_APPROVE_VERDICT } });
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
+    // A turn that opens (turn/started is emitted) and then dies without ever
+    // completing: the model may already have been billed for it.
+    queueTurnHangAfterStarted() {
+      const state = readFakeState();
+      state.queue.push({ hangAfterStarted: true });
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
     // Rewrites the stored completedAt of every review job in both the state
     // index and the per-job file, so the recency window sees a stale thread.
     ageReviewJobs(hoursAgo) {
@@ -2856,6 +2885,154 @@ test("a review job is tagged resumable while it is still running, not only once 
       child.kill("SIGTERM");
     });
   }
+});
+
+test("an inline-diff --resume run joins the same thread lineage as self-collect runs", () => {
+  // Regression: the inline (single-shot) branch used to pass no session
+  // options while still recording resumable:true plus the ephemeral thread id
+  // runAppServerTurn returns. Because the reuse resolver only ever considers
+  // the NEWEST resumable job, one small single-file review in the middle of a
+  // review -> fix -> re-review loop permanently stranded the accumulated
+  // context behind an ephemeral (and, against a real backend, prunable) id.
+  const fixture = setupResumeReviewRepo();
+
+  // Run 1: three files -> self-collect, opens the persistent thread.
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+  const lineageThreadId = fixture.readReviewJobs()[0].threadId;
+  assert.ok(lineageThreadId);
+
+  // Run 2: one file -> inline branch. It must resume the same thread.
+  fixture.shrinkToInlineDiff();
+  fixture.clearRequests();
+  fixture.queueOneInlineReview();
+  const second = fixture.runReview(["--resume"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const inlineRequests = fixture.requests;
+  const inlineResumes = inlineRequests.filter((entry) => entry.method === "thread/resume");
+  assert.equal(inlineResumes.length, 1, "the inline branch must participate in thread reuse");
+  assert.equal(inlineResumes[0].params.threadId, lineageThreadId);
+  assert.ok(
+    !inlineRequests.some((entry) => entry.method === "thread/start"),
+    "resuming must not open a new thread on the inline branch"
+  );
+
+  // Run 3: back to three files -> self-collect. It must resume the SAME
+  // lineage, not the ephemeral thread the inline run would previously have
+  // left as the newest resumable candidate.
+  fixture.growToSelfCollect("v3");
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  const third = fixture.runReview(["--resume"]);
+  assert.equal(third.status, 0, third.stderr);
+
+  const finalResumes = fixture.requests.filter((entry) => entry.method === "thread/resume");
+  assert.equal(finalResumes.length, 1);
+  assert.equal(
+    finalResumes[0].params.threadId,
+    lineageThreadId,
+    "run 3 must resume the original lineage, not an ephemeral inline thread"
+  );
+
+  const jobs = fixture.readReviewJobs();
+  assert.equal(jobs.length, 3);
+  assert.ok(jobs.every((job) => job.resumable === true));
+  // Every job in the chain points at the one persistent thread, so no run
+  // recorded a resumable job against a thread nobody can resume.
+  assert.ok(jobs.every((job) => job.threadId === lineageThreadId));
+});
+
+test("an inline-diff --resume run with no prior thread starts a named persistent thread", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.shrinkToInlineDiff();
+  fixture.queueOneInlineReview();
+
+  const result = fixture.runReview(["--resume"]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const requests = fixture.requests;
+  const starts = requests.filter((entry) => entry.method === "thread/start");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].params.ephemeral, false, "an inline session-mode thread must persist");
+  const named = requests.filter((entry) => entry.method === "thread/name/set");
+  assert.equal(named.length, 1, "persistThread and threadName must travel together here too");
+  assert.match(named[0].params.name, /Codex Companion Review:/);
+
+  const [job] = fixture.readReviewJobs();
+  assert.equal(job.resumable, true);
+  assert.ok(job.threadId, "the inline run must record the persistent thread id for the next run");
+});
+
+test("an inline-diff review with no reuse flags stays ephemeral and unnamed", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.shrinkToInlineDiff();
+  fixture.queueOneInlineReview();
+
+  const result = fixture.runReview([]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const requests = fixture.requests;
+  const starts = requests.filter((entry) => entry.method === "thread/start");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].params.ephemeral, true);
+  assert.ok(!requests.some((entry) => entry.method === "thread/name/set"));
+  assert.ok(!requests.some((entry) => entry.method === "thread/resume"));
+  const [job] = fixture.readReviewJobs();
+  assert.ok(!("resumable" in job), "a no-flag inline review job must not carry a resumable field");
+});
+
+test("an inline-diff --resume run falls back to a fresh thread when the prior one is gone", () => {
+  // runAppServerTurn resumes without the investigation runner's built-in
+  // try/catch, so the fallback has to be arranged by the review caller. A
+  // pruned thread must not turn a review into a hard failure.
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.ok(fixture.readReviewJobs()[0].threadId);
+
+  fixture.dropThreads();
+  fixture.shrinkToInlineDiff();
+  fixture.clearRequests();
+  fixture.queueOneInlineReview();
+  const second = fixture.runReview(["--resume"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const requests = fixture.requests;
+  assert.ok(requests.some((entry) => entry.method === "thread/resume"), "resume was attempted");
+  const starts = requests.filter((entry) => entry.method === "thread/start");
+  assert.equal(starts.length, 1, "and it fell back to a fresh thread instead of failing");
+  assert.equal(starts[0].params.ephemeral, false, "the fallback thread is still persistent");
+});
+
+test("an inline-diff --resume run does not re-run a turn that already started", () => {
+  // The fallback must key off "no turn ever opened", not "the run threw".
+  // thread/resume succeeds here and a turn opens, so the model may already have
+  // been billed — retrying on a fresh thread would silently double-spend.
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+
+  fixture.shrinkToInlineDiff();
+  fixture.clearRequests();
+  fixture.queueTurnHangAfterStarted();
+  const second = fixture.runReview(["--resume", "--turn-idle-timeout", "1"]);
+  assert.notEqual(second.status, 0, "a stalled turn must surface as a failure");
+
+  const requests = fixture.requests;
+  assert.equal(requests.filter((entry) => entry.method === "thread/resume").length, 1);
+  assert.ok(
+    !requests.some((entry) => entry.method === "thread/start"),
+    "a turn that already started must not be retried on a fresh thread"
+  );
+  assert.equal(
+    requests.filter((entry) => entry.method === "turn/start").length,
+    1,
+    "the billed turn must be attempted exactly once"
+  );
 });
 
 test("adversarial-review rejects --resume together with --fresh", () => {
