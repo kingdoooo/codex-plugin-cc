@@ -415,4 +415,60 @@ test("mid-size working-tree diff also gets investigation inline", () => {
   assert.match(context.content, /STAGED_FED_MARKER/);
   assert.match(context.content, /UNSTAGED_FED_MARKER/);
   assert.match(context.collectionGuidance, /full diff is embedded below/i);
+  // Nothing was skipped, so the guidance must NOT hedge about untracked files.
+  assert.doesNotMatch(context.collectionGuidance, /could not be embedded/i);
+});
+
+test("fed working-tree guidance warns when untracked content could not be embedded", () => {
+  // An untracked file never appears in `git diff`, and oversized/binary ones are
+  // reduced to a `(skipped: ...)` marker. Telling the model "the full diff is
+  // embedded — do not re-derive it" would then assert complete evidence while
+  // discouraging the one action that recovers the missing content: reading the
+  // file. The fed wording must own that gap.
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "a.js", "b.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), 'export const value = "SKIPPED_CASE_MARKER_A";\n');
+  fs.writeFileSync(path.join(cwd, "b.js"), 'export const value = "SKIPPED_CASE_MARKER_B";\n');
+  // Untracked and over MAX_UNTRACKED_BYTES (24 KiB), so its contents are skipped.
+  fs.writeFileSync(path.join(cwd, "big-untracked.txt"), "x".repeat(30 * 1024));
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.mode, "working-tree");
+  assert.equal(context.inputMode, "self-collect");
+  assert.equal(context.investigationInline, true, "routing is unchanged: this still takes the fed path");
+  assert.match(context.content, /SKIPPED_CASE_MARKER_A/);
+  assert.match(context.content, /skipped: 30720 bytes/);
+  assert.match(context.collectionGuidance, /full diff is embedded below/i);
+  assert.match(context.collectionGuidance, /read them directly with read-only commands/i);
+});
+
+test("fed branch-mode guidance keeps the unqualified wording (no untracked concept)", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "seed.js"), "export const value = 'seed';\n");
+  run("git", ["add", "seed.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  run("git", ["checkout", "-b", "feature/test"], { cwd });
+  fs.writeFileSync(path.join(cwd, "doc-one.md"), "# planning doc\n".repeat(50));
+  fs.writeFileSync(path.join(cwd, "doc-two.md"), "# spec doc\n".repeat(50));
+  run("git", ["add", "doc-one.md", "doc-two.md"], { cwd });
+  run("git", ["commit", "-m", "docs"], { cwd });
+  // An untracked file that WOULD be skipped in working-tree mode. A branch diff
+  // does not consider the working tree at all, so the wording must not hedge.
+  fs.writeFileSync(path.join(cwd, "big-untracked.txt"), "x".repeat(30 * 1024));
+
+  const target = resolveReviewTarget(cwd, { base: "main" });
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.mode, "branch");
+  assert.equal(context.investigationInline, true);
+  assert.match(context.collectionGuidance, /full diff is embedded below/i);
+  assert.doesNotMatch(context.collectionGuidance, /could not be embedded/i);
 });

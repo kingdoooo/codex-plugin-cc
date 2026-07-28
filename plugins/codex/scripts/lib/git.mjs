@@ -334,7 +334,15 @@ function buildAdversarialCollectionGuidance(options = {}) {
   }
 
   if (options.investigationInline) {
-    return "The full diff is embedded below as primary evidence — do not re-derive it with git commands. Run read-only commands only when you need context beyond the diff itself: surrounding code, callers, history, or tests.";
+    const fed =
+      "The full diff is embedded below as primary evidence — do not re-derive it with git commands. Run read-only commands only when you need context beyond the diff itself: surrounding code, callers, history, or tests.";
+    // Untracked files never appear in `git diff`, and oversized/binary ones are
+    // reduced to a `(skipped: ...)` marker. Without this clause the fed wording
+    // would claim complete evidence while telling the model not to go looking.
+    if (options.hasSkippedUntracked) {
+      return `${fed} Some untracked files could not be embedded — read them directly with read-only commands.`;
+    }
+    return fed;
   }
 
   return "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
@@ -355,9 +363,21 @@ export function collectReviewContext(cwd, target, options = {}) {
   let singleShotInline;
   let investigationInline;
   let diffBytes;
+  // Only meaningful in working-tree mode; a branch diff ignores the working tree.
+  let fedDiffOmitsUntracked = false;
 
   if (target.mode === "working-tree") {
     const state = getWorkingTreeState(repoRoot);
+    // hasSkippedUntrackedContent() stats and reads every untracked file, and two
+    // decisions below consult it. Memoize so it runs at most once, and keep it
+    // lazy so neither decision pays for it when a cheaper conjunct already lost.
+    let skippedUntracked = null;
+    const hasSkippedUntracked = () => {
+      if (skippedUntracked === null) {
+        skippedUntracked = hasSkippedUntrackedContent(repoRoot, state.untracked);
+      }
+      return skippedUntracked;
+    };
     diffBytes = measureCombinedGitOutputBytes(
       repoRoot,
       [
@@ -370,11 +390,14 @@ export function collectReviewContext(cwd, target, options = {}) {
       options.includeDiff ??
       (listUniqueFiles(state.staged, state.unstaged, state.untracked).length <= maxInlineFiles &&
         diffBytes <= maxInlineDiffBytes &&
-        !hasSkippedUntrackedContent(repoRoot, state.untracked));
+        !hasSkippedUntracked());
     // Only the byte bound matters here: skipped untracked content is fine
     // because the multi-turn path still has read-only shell to inspect it.
     investigationInline =
       options.includeDiff === undefined && !singleShotInline && diffBytes <= investigationInlineMaxBytes;
+    // The fed diff is then incomplete, so the guidance must say so rather than
+    // claim the embedded diff is the whole change.
+    fedDiffOmitsUntracked = investigationInline && hasSkippedUntracked();
     details = collectWorkingTreeContext(repoRoot, state, {
       includeDiff: singleShotInline || investigationInline
     });
@@ -406,7 +429,8 @@ export function collectReviewContext(cwd, target, options = {}) {
     investigationInline,
     collectionGuidance: buildAdversarialCollectionGuidance({
       includeDiff: singleShotInline,
-      investigationInline
+      investigationInline,
+      hasSkippedUntracked: fedDiffOmitsUntracked
     }),
     ...details
   };
