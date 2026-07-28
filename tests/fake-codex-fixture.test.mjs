@@ -6,14 +6,15 @@ import { resolveReviewTurnIdleTimeoutMs, resolveRunExitStatus, runAppServerTurn 
 import { makeTempDir } from "./helpers.mjs";
 
 test("resolveReviewTurnIdleTimeoutMs defaults the review watchdog and honors explicit values", () => {
-  // The 180s idle watchdog is a REVIEW concern (a stalled review should not hang
+  // The idle watchdog is a REVIEW concern (a stalled review should not hang
   // forever). It must NOT be baked into the shared runAppServerTurn default,
   // because /codex:task also calls runAppServerTurn and a long-thinking task
-  // would then be aborted at 180s with no task-level knob. The default lives in
-  // this review-only helper instead.
-  assert.equal(resolveReviewTurnIdleTimeoutMs(undefined), 180_000, "review default is 180s");
+  // would then be aborted at this threshold with no task-level knob. The default
+  // lives in this review-only helper instead.
+  assert.equal(resolveReviewTurnIdleTimeoutMs(undefined), 1_200_000, "review default is 1200s");
+  assert.equal(resolveReviewTurnIdleTimeoutMs(null), 1_200_000, "null falls back to the review default");
   assert.equal(resolveReviewTurnIdleTimeoutMs(300), 300, "explicit ms passes through");
-  assert.equal(resolveReviewTurnIdleTimeoutMs(0), 180_000, "zero/invalid falls back to the review default");
+  assert.equal(resolveReviewTurnIdleTimeoutMs(0), 1_200_000, "zero/invalid falls back to the review default");
 });
 
 test("runAppServerTurn passes through an absent idle timeout (task path arms no watchdog)", async () => {

@@ -65,7 +65,9 @@ const DEFAULT_CONTINUE_PROMPT =
 // disable it. Review callers opt in via resolveReviewTurnIdleTimeoutMs(); the
 // runners pass whatever they are given straight through to captureTurn, which
 // arms no watchdog for an absent/invalid value.
-const DEFAULT_TURN_IDLE_TIMEOUT_MS = 180_000;
+// Measured 2026-07-27: healthy Bedrock gpt-5.6 xhigh turns go silent for well
+// over 600s while reasoning; 180s killed them routinely.
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 1_200_000;
 
 // Demoted-inference quiet window (Defect A). Inferred turn completion is a
 // FALLBACK for the subagent/collab case where the main thread never emits a
