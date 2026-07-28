@@ -1798,6 +1798,40 @@ test("finalize retry also uses the downgraded effort", async () => {
   }
 });
 
+test("empty-finalize retry also uses the downgraded effort", async () => {
+  // The empty-message violation reaches captureTurn by a different branch than
+  // the commands violation (EMPTY_FINALIZE_REMINDER vs STRICT_FINALIZE_REMINDER),
+  // so cover it too: raising effort is never the fix for a dropped Message item.
+  const cwd = makeTempDir("codex-inv-effort-empty-retry-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    // First finalize completes with no message at all => empty-specific retry.
+    fake.queueTurnResponse({ commands: [], finalAnswer: null });
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: APPROVE_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "xhigh"
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 3, "1 recon + 2 finalize attempts");
+    assert.equal(starts[0].params.effort, "xhigh", "investigation turn keeps caller effort");
+    assert.equal(starts[1].params.effort, "medium", "first finalize attempt downgrades");
+    assert.equal(starts[2].params.effort, "medium", "the empty-path retry stays downgraded");
+    assert.match(
+      starts[2].params.input?.[0]?.text ?? "",
+      /no structured output was received/,
+      "the retry under test must be the empty-violation path, not the commands one"
+    );
+  } finally {
+    fake.close();
+  }
+});
+
 test("finalize effort is resolved per call, not cached at import time", async () => {
   // Regression guard: reading the env var at module load would make the first
   // run in a process pin the value for every later run.
