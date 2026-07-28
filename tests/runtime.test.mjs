@@ -441,7 +441,8 @@ test("adversarial review asks Codex to inspect larger diffs itself", () => {
   // The investigate prompt (turn 1) contained the self-collect guidance; the
   // finalize prompt (turn 2) references the investigation completed in prior turns.
   assert.match(state.lastTurnStart.prompt, /investigation|structured review/i);
-  // File contents must not be inlined in either prompt (self-collect mode)
+  // The finalize prompt carries no repository context of its own — the diff was
+  // already established during the investigation turns it refers back to.
   assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
 });
 

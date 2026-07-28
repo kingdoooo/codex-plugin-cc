@@ -64,15 +64,19 @@ const DEFAULT_CONTINUE_PROMPT =
 // otherwise be aborted at this threshold with no task-level way to raise or
 // disable it. Review callers opt in via resolveReviewTurnIdleTimeoutMs(); the
 // runners pass whatever they are given straight through to captureTurn. When
-// no explicit value is supplied, captureTurn falls back to the generous
-// always-on stall default below (env-tunable), so task runs are still bounded.
-const DEFAULT_TURN_IDLE_TIMEOUT_MS = 180_000;
+// no explicit value is supplied, captureTurn falls back to the always-on stall
+// default below (env-tunable), so task runs are still bounded.
+// Measured 2026-07-27: healthy Bedrock gpt-5.6 xhigh turns go silent for well
+// over 600s while reasoning; 180s killed them routinely. This review default is
+// therefore LOOSER than DEFAULT_TURN_STALL_MS, not tighter.
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 1_200_000;
 
 // Always-on turn guards (from upstream PR #361). Every captureTurn is bounded
 // three ways so a wedged turn fails toward "didn't finish" instead of hanging:
 //   - stall:   no BELONGING traffic for this long => stalled. Review callers
-//     pass an explicit (tighter) turnIdleTimeoutMs; everything else gets this
-//     default, overridable via CODEX_COMPANION_TURN_STALL_MS.
+//     pass an explicit turnIdleTimeoutMs (looser, since reasoning backends go
+//     silent for long stretches); everything else gets this default,
+//     overridable via CODEX_COMPANION_TURN_STALL_MS.
 //   - ceiling: absolute backstop on a single turn's total duration,
 //     overridable via CODEX_COMPANION_TURN_TIMEOUT_MS.
 //   - exit:    app-server process death rejects immediately.
@@ -696,8 +700,8 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   // link, a hung MCP server, or a wedged turn delivers neither, so without this
   // the turn would hang forever. We reject after `stallMs` of silence,
   // re-arming ONLY on traffic that belongs to this turn (Defect B: foreign
-  // chatter must not mask a stuck turn). Review callers pass a tight explicit
-  // window; everything else gets the generous always-on default.
+  // chatter must not mask a stuck turn). Review callers pass an explicit
+  // window; everything else gets the always-on default.
   const stallMs = resolveTurnStallMs(options.turnIdleTimeoutMs);
   let idleTimer = null;
   let idleReject = null;
@@ -1430,6 +1434,23 @@ export async function runAppServerTurn(cwd, options = {}) {
 const DEFAULT_MAX_INVESTIGATION_TURNS = 10;
 const INVESTIGATION_CONTINUATION_CUE = "Continue your investigation.";
 
+const DEFAULT_FINALIZE_EFFORT = "medium";
+const FINALIZE_EFFORT_VALUES = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
+// The finalize turn translates already-formed conclusions into schema JSON —
+// mechanical work that does not benefit from a reasoning-heavy effort. Read at
+// call time (not import time) so the env override always takes effect.
+function resolveFinalizeEffort(callerEffort) {
+  const raw = String(process.env.CODEX_COMPANION_FINALIZE_EFFORT ?? "").trim().toLowerCase();
+  if (raw === "inherit") {
+    return callerEffort ?? null;
+  }
+  if (FINALIZE_EFFORT_VALUES.has(raw)) {
+    return raw;
+  }
+  return DEFAULT_FINALIZE_EFFORT;
+}
+
 export async function runAppServerInvestigation(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1611,7 +1632,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
               threadId,
               input: buildTurnInput(promptText),
               model: options.model ?? null,
-              effort: options.effort ?? null,
+              effort: resolveFinalizeEffort(options.effort ?? null),
               outputSchema: options.outputSchema ?? null
             }),
           { onProgress: options.onProgress, turnIdleTimeoutMs, inferredCompletionQuietMs }

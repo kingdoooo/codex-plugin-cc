@@ -1677,3 +1677,161 @@ test("a verdict streamed after a readiness cue is captured, not discarded (Defec
     fake.close();
   }
 });
+
+test("finalize turn downgrades to medium effort while investigation keeps caller effort", async () => {
+  const cwd = makeTempDir("codex-inv-effort-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "xhigh"
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 2);
+    assert.equal(starts[0].params.effort, "xhigh", "investigation turn keeps caller effort");
+    assert.equal(starts[1].params.effort, "medium", "finalize turn downgrades to medium");
+  } finally {
+    fake.close();
+  }
+});
+
+test("CODEX_COMPANION_FINALIZE_EFFORT=inherit keeps caller effort on finalize", async () => {
+  process.env.CODEX_COMPANION_FINALIZE_EFFORT = "inherit";
+  const cwd = makeTempDir("codex-inv-effort-inherit-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "xhigh"
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.at(-1).params.effort, "xhigh");
+  } finally {
+    delete process.env.CODEX_COMPANION_FINALIZE_EFFORT;
+    fake.close();
+  }
+});
+
+test("an explicit CODEX_COMPANION_FINALIZE_EFFORT value overrides the medium default", async () => {
+  process.env.CODEX_COMPANION_FINALIZE_EFFORT = "LOW";
+  const cwd = makeTempDir("codex-inv-effort-explicit-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "xhigh"
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.at(-1).params.effort, "low", "value is normalized and honored");
+  } finally {
+    delete process.env.CODEX_COMPANION_FINALIZE_EFFORT;
+    fake.close();
+  }
+});
+
+test("an unrecognized CODEX_COMPANION_FINALIZE_EFFORT falls back to medium", async () => {
+  process.env.CODEX_COMPANION_FINALIZE_EFFORT = "turbo";
+  const cwd = makeTempDir("codex-inv-effort-invalid-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "xhigh"
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.at(-1).params.effort, "medium");
+  } finally {
+    delete process.env.CODEX_COMPANION_FINALIZE_EFFORT;
+    fake.close();
+  }
+});
+
+test("finalize retry also uses the downgraded effort", async () => {
+  const cwd = makeTempDir("codex-inv-effort-retry-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    // First finalize violates the contract by running a command => strict retry.
+    fake.queueTurnResponse({
+      commands: [{ command: "wc -l README.md", exitCode: 0 }],
+      finalAnswer: { text: "{\"cmd\":\"wc -l README.md\"}" }
+    });
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: APPROVE_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "xhigh"
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 3);
+    assert.equal(starts[1].params.effort, "medium");
+    assert.equal(starts[2].params.effort, "medium");
+  } finally {
+    fake.close();
+  }
+});
+
+test("finalize effort is resolved per call, not cached at import time", async () => {
+  // Regression guard: reading the env var at module load would make the first
+  // run in a process pin the value for every later run.
+  const cwd = makeTempDir("codex-inv-effort-percall-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "xhigh"
+    });
+    assert.equal(fake.requests.filter((r) => r.method === "turn/start").at(-1).params.effort, "medium");
+  } finally {
+    fake.close();
+  }
+
+  process.env.CODEX_COMPANION_FINALIZE_EFFORT = "high";
+  const cwd2 = makeTempDir("codex-inv-effort-percall-2-");
+  const fake2 = setupFakeCodex({ cwd: cwd2 });
+  try {
+    fake2.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake2.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    await runAppServerInvestigation(fake2.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "xhigh"
+    });
+    assert.equal(fake2.requests.filter((r) => r.method === "turn/start").at(-1).params.effort, "high");
+  } finally {
+    delete process.env.CODEX_COMPANION_FINALIZE_EFFORT;
+    fake2.close();
+  }
+});

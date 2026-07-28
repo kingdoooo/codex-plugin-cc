@@ -511,6 +511,11 @@ async function executeReviewRun(request) {
 
   let result;
   if (context.inputMode === "self-collect") {
+    if (!context.investigationInline) {
+      request.onProgress?.(
+        "Diff exceeds the investigation inline budget (CODEX_COMPANION_INVESTIGATION_INLINE_MAX_BYTES); Codex will re-derive it with read-only commands."
+      );
+    }
     const investigatePrompt = buildAdversarialInvestigatePrompt(context, focusText);
     const finalizePrompt = buildAdversarialFinalizePrompt(context, focusText);
     result = await runAppServerInvestigation(context.repoRoot, {
