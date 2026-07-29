@@ -69,11 +69,60 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
-  // The socket whose request is currently awaiting an upstream response. If that
-  // socket disconnects before the response arrives (e.g. its turn watchdog fired
-  // on a start that never ACKed), the upstream work is orphaned — see onSocketGone.
-  let pendingUpstreamSocket = null;
+  // One entry per request forwarded upstream and not yet settled, each holding
+  // the socket that sent it. If a socket disconnects while it still owns an
+  // entry, the upstream work it started is orphaned — see onSocketGone.
+  //
+  // Claims are tracked per request rather than per socket because one client can
+  // have two requests in flight at once: a turn/start that upstream never ACKed
+  // plus the turn/interrupt its own watchdog fired. The interrupt settling says
+  // nothing about the start, so it must not retire the start's claim.
+  const pendingUpstreamClaims = new Set();
+  // Thread ids whose stream has ended, mapped to the socket that owned it.
+  // Upstream can emit stragglers for a finished turn long after the fact, by
+  // which time an unrelated client may hold the routing target; delivering one
+  // there makes that client mistake a foreign turn/started for its own and hang
+  // on a turn it never asked for. Keyed by owner rather than as a bare set so
+  // only genuinely cross-client stragglers are dropped: a straggler reaching the
+  // same client that owned the thread routes exactly as it did before.
+  const retiredThreadOwners = new Map();
+  const RETIRED_THREAD_LIMIT = 256;
   const sockets = new Set();
+
+  function claimUpstream(socket) {
+    const claim = { socket };
+    pendingUpstreamClaims.add(claim);
+    return claim;
+  }
+
+  function hasPendingUpstream(socket) {
+    for (const claim of pendingUpstreamClaims) {
+      if (claim.socket === socket) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function retireThreadIds(threadIds, owner) {
+    if (!threadIds) {
+      return;
+    }
+    for (const threadId of threadIds) {
+      retiredThreadOwners.delete(threadId);
+      retiredThreadOwners.set(threadId, owner);
+    }
+    // Bounded so a long-lived broker cannot accumulate thread ids without limit;
+    // insertion order makes the oldest retirement the first to be forgotten, and
+    // stragglers for a turn that old no longer arrive.
+    while (retiredThreadOwners.size > RETIRED_THREAD_LIMIT) {
+      const oldest = retiredThreadOwners.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      retiredThreadOwners.delete(oldest.value);
+    }
+  }
 
   // Idle self-shutdown: the broker is keyed per-cwd and is only reaped on a
   // later ensureBrokerSession for the SAME cwd. A broker for a cwd that is never
@@ -121,8 +170,7 @@ async function main() {
     // that reached turn/completed (or was interrupted) has already cleared
     // activeStreamSocket via routeNotification, so a normal close does not
     // trigger this.
-    if (socket === pendingUpstreamSocket || socket === activeStreamSocket) {
-      pendingUpstreamSocket = null;
+    if (hasPendingUpstream(socket) || socket === activeStreamSocket) {
       shutdown(server).finally(() => process.exit(0));
       return;
     }
@@ -135,10 +183,19 @@ async function main() {
     if (!target) {
       return;
     }
+    // A straggler for a retired thread belongs to a turn that has ended. Routing
+    // it to a *different* client than the one that owned it is the leak: that
+    // client would read a foreign turn/started as its own. Dropping it costs
+    // nothing, since the turn it describes has no listener left.
+    const threadId = message.params?.threadId ?? null;
+    const retiredOwner = threadId ? retiredThreadOwners.get(threadId) : undefined;
+    if (retiredOwner !== undefined && retiredOwner !== target) {
+      return;
+    }
     send(target, message);
     if (message.method === "turn/completed" && activeStreamSocket === target) {
-      const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
+        retireThreadIds(activeStreamThreadIds, target);
         activeStreamSocket = null;
         activeStreamThreadIds = null;
         if (activeRequestSocket === target) {
@@ -239,7 +296,7 @@ async function main() {
         }
 
         if (allowInterruptDuringActiveStream) {
-          pendingUpstreamSocket = socket;
+          const claim = claimUpstream(socket);
           try {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
@@ -249,16 +306,21 @@ async function main() {
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
           } finally {
-            if (pendingUpstreamSocket === socket) {
-              pendingUpstreamSocket = null;
-            }
+            pendingUpstreamClaims.delete(claim);
           }
           continue;
         }
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
-        pendingUpstreamSocket = socket;
+        const claim = claimUpstream(socket);
+        // Un-retire before forwarding, not after the ACK: a resumed turn reuses
+        // its thread id, and upstream can emit that turn's own turn/started while
+        // the start RPC is still awaiting its ACK. Clearing the retirement only
+        // afterwards would drop that notification and hang the client.
+        if (isStreaming && message.params?.threadId) {
+          retiredThreadOwners.delete(message.params.threadId);
+        }
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
@@ -266,6 +328,9 @@ async function main() {
           if (isStreaming) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            for (const threadId of activeStreamThreadIds) {
+              retiredThreadOwners.delete(threadId);
+            }
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -282,12 +347,12 @@ async function main() {
             activeStreamSocket = null;
           }
         } finally {
-          // The request settled (ACK for a streaming turn, or a terminal result):
-          // it is no longer in flight, so the socket closing after this is normal
-          // teardown, not an abandoned upstream request.
-          if (pendingUpstreamSocket === socket) {
-            pendingUpstreamSocket = null;
-          }
+          // This request settled (ACK for a streaming turn, or a terminal
+          // result), so it is no longer in flight. Only its own claim is
+          // retired: any other request this socket still has upstream — such as
+          // a turn/start whose ACK never came — stays claimed, so a close after
+          // this is still recognised as abandonment.
+          pendingUpstreamClaims.delete(claim);
         }
       }
     });
