@@ -1449,6 +1449,32 @@ const INVESTIGATION_CONTINUATION_CUE = "Continue your investigation.";
 const DEFAULT_FINALIZE_EFFORT = "medium";
 const FINALIZE_EFFORT_VALUES = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 
+// A resumed thread carries its whole prior history into the next turn's prompt,
+// so a full-depth review can only be resumed until the accumulated history no
+// longer fits. The overflow is rejected before the model runs, which makes it
+// the one turn failure that is provably zero-output: re-running it on a fresh
+// thread costs a cold investigation but cannot double-spend.
+//
+// The measured shape (Bedrock, gpt-5.5) is:
+//   "prompt tokens (278972) exceed customer model maximum (278528)"
+// The remaining patterns cover the wordings the app-server relays from other
+// backends (OpenAI's context_length_exceeded, Anthropic's "prompt is too
+// long"), since the message is passed through verbatim rather than normalized.
+const CONTEXT_OVERFLOW_PATTERNS = [
+  /\bprompt tokens\s*\(\s*\d+\s*\)\s*exceeds?\b/i,
+  /\bexceeds?\b[^.]*\bmodel maximum\b/i,
+  /\bcontext[ _-]?length[ _-]?exceeded\b/i,
+  /\bmaximum context length\b/i,
+  /\bcontext window\b/i,
+  /\bprompt is too long\b/i,
+  /\btoo many (?:input |prompt )?tokens\b/i
+];
+
+export function isContextOverflowError(message) {
+  const text = String(message ?? "");
+  return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 // The finalize turn translates already-formed conclusions into schema JSON —
 // mechanical work that does not benefit from a reasoning-heavy effort. Read at
 // call time (not import time) so the env override always takes effect.
@@ -1529,19 +1555,57 @@ export async function runAppServerInvestigation(cwd, options = {}) {
     }
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", { threadId });
 
-    const effectiveInvestigatePrompt = buildInvestigatePrompt
-      ? String(buildInvestigatePrompt({ resumed: resumedThread }) ?? "").trim()
-      : investigatePrompt;
-    if (!effectiveInvestigatePrompt) {
-      throw new Error("runAppServerInvestigation requires a non-empty investigate prompt.");
-    }
+    const resolveInvestigatePrompt = (resumed) => {
+      const resolved = buildInvestigatePrompt
+        ? String(buildInvestigatePrompt({ resumed }) ?? "").trim()
+        : investigatePrompt;
+      if (!resolved) {
+        throw new Error("runAppServerInvestigation requires a non-empty investigate prompt.");
+      }
+      return resolved;
+    };
+    let effectiveInvestigatePrompt = resolveInvestigatePrompt(resumedThread);
 
     let turnCount = 0;
     let truncated = false;
     let totalCommandsRun = 0;
+    let overflowFallbackUsed = false;
     const aggregatedCommandExecutions = [];
     const aggregatedFileChanges = [];
     const investigationMessages = [];
+
+    // A resumed thread only overflows once its accumulated history is replayed
+    // as the next prompt, so the failure lands on the FIRST turn — after
+    // thread/resume already succeeded, which is why the resume try/catch above
+    // cannot see it. Shedding the history and re-investigating from turn 1 is
+    // safe precisely because the prompt was rejected before the model ran:
+    // nothing was produced, so nothing is lost or re-billed. Bounded to one
+    // attempt — a fresh thread has no history left to shed, so a second overflow
+    // would only loop. Callers restart the loop at turn 1 when this returns true.
+    const attemptOverflowFallback = async (errorMessage, turnIndex) => {
+      if (
+        !resumedThread ||
+        overflowFallbackUsed ||
+        turnIndex !== 1 ||
+        !isContextOverflowError(errorMessage)
+      ) {
+        return false;
+      }
+      overflowFallbackUsed = true;
+      resumedThread = false;
+      emitProgress(
+        options.onProgress,
+        "Resumed thread overflows the model context; falling back to a fresh thread.",
+        "starting"
+      );
+      threadId = await startFreshThread();
+      emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", { threadId });
+      // The continuation note must not survive onto a thread that has never seen
+      // this worktree.
+      effectiveInvestigatePrompt = resolveInvestigatePrompt(false);
+      turnCount = 0;
+      return true;
+    };
 
     for (let i = 1; i <= maxInvestigationTurns; i += 1) {
       const promptText = i === 1 ? effectiveInvestigatePrompt : INVESTIGATION_CONTINUATION_CUE;
@@ -1563,6 +1627,13 @@ export async function runAppServerInvestigation(cwd, options = {}) {
           { onProgress: options.onProgress, turnIdleTimeoutMs, inferredCompletionQuietMs }
         );
       } catch (transportError) {
+        const message = transportError?.message ?? String(transportError);
+        // The overflow was measured as an `error` notification (handled below),
+        // but the same rejection can arrive on the turn/start RPC itself.
+        if (await attemptOverflowFallback(message, i)) {
+          i = 0; // the loop's `i += 1` restarts the investigation at turn 1
+          continue;
+        }
         return {
           status: 1,
           threadId,
@@ -1570,7 +1641,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
           finalMessage: "",
           reasoningSummary: [],
           turn: null,
-          error: { message: transportError?.message ?? String(transportError) },
+          error: { message },
           stderr: cleanCodexStderr(client.stderr),
           fileChanges: aggregatedFileChanges,
           touchedFiles: collectTouchedFiles(aggregatedFileChanges),
@@ -1603,6 +1674,15 @@ export async function runAppServerInvestigation(cwd, options = {}) {
       // produced no usable output — i.e. it did not recover.
       const turnHadAgentMessage = Boolean(turnState.lastAgentMessage);
       const turnRecovered = turnHadAgentMessage && turnState.finalTurn?.status === "completed";
+
+      if (
+        turnState.error &&
+        !turnRecovered &&
+        (await attemptOverflowFallback(turnState.error.message, i))
+      ) {
+        i = 0; // the loop's `i += 1` restarts the investigation at turn 1
+        continue;
+      }
 
       if (turnState.error && !turnRecovered) {
         return {

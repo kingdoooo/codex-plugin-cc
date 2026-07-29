@@ -1982,3 +1982,145 @@ test("investigation requires an investigate prompt from one of the two option sh
     fake.close();
   }
 });
+
+// -------------------------------------------------------------------
+// Resumed thread that overflows the model context window
+// -------------------------------------------------------------------
+
+// The measured shape, from a real Bedrock run against a 10-turn prior thread:
+// thread/resume SUCCEEDED, then the first turn died in 11s. The history only
+// becomes a prompt when a turn starts, so the overflow can only surface here.
+const OVERFLOW_ERROR = "prompt tokens (278972) exceed customer model maximum (278528)";
+
+test("a resumed thread whose first turn overflows the context falls back to a fresh thread", async () => {
+  const cwd = makeTempDir("codex-inv-overflow-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Run 1 builds the persistent thread the next run will try to resume.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    const first = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      persistThread: true,
+      threadName: "Codex Companion Review: test"
+    });
+    assert.ok(first.threadId);
+
+    // Run 2 resumes it. The first turn errors with the overflow message and
+    // produces nothing, so re-running it on a fresh thread cannot double-spend.
+    fake.queueTurnResponse({ finalAnswer: null, turnError: { message: OVERFLOW_ERROR } });
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done on the fresh thread." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+
+    const progress = [];
+    const second = await runAppServerInvestigation(fake.cwd, {
+      buildInvestigatePrompt: ({ resumed }) =>
+        resumed ? "<continuation>resumed</continuation> Investigate." : "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      resumeThreadId: first.threadId,
+      persistThread: true,
+      threadName: "Codex Companion Review: test",
+      onProgress: (event) => {
+        progress.push(typeof event === "string" ? event : event?.message ?? "");
+      }
+    });
+
+    assert.equal(second.status, 0, "the fallback run must complete the review");
+    assert.notEqual(second.threadId, first.threadId, "the result must carry the FRESH thread id");
+    assert.match(second.finalMessage, /"verdict"/);
+
+    const requests = fake.requests;
+    const resumes = requests.filter((entry) => entry.method === "thread/resume");
+    assert.equal(resumes.length, 1, "resume was attempted once");
+    // Run 1 opened one thread; the fallback opens the second.
+    const starts = requests.filter((entry) => entry.method === "thread/start");
+    assert.equal(starts.length, 2, "the overflow must open exactly one fresh thread");
+    assert.equal(starts[1].params.ephemeral, false, "the fallback thread stays persistent");
+
+    // The continuation note must NOT survive onto the fresh thread: it tells the
+    // model it already reviewed this worktree in this thread, which is a lie
+    // about a thread that was just created.
+    const turnStarts = requests.filter((entry) => entry.method === "turn/start");
+    const overflowedTurn = turnStarts[2];
+    assert.match(JSON.stringify(overflowedTurn.params.input), /<continuation>resumed<\/continuation>/);
+    const freshTurn = turnStarts[3];
+    assert.doesNotMatch(JSON.stringify(freshTurn.params.input), /<continuation>/);
+
+    assert.ok(
+      progress.some((message) => /overflow/i.test(message) && /fresh/i.test(message)),
+      `the fallback must be announced, got: ${JSON.stringify(progress)}`
+    );
+  } finally {
+    fake.close();
+  }
+});
+
+test("a FRESH thread that overflows on turn 1 fails instead of retrying forever", async () => {
+  const cwd = makeTempDir("codex-inv-overflow-fresh-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ finalAnswer: null, turnError: { message: OVERFLOW_ERROR } });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      persistThread: true,
+      threadName: "Codex Companion Review: test"
+    });
+
+    assert.notEqual(result.status, 0, "nothing can be salvaged, so the run must fail");
+    assert.match(result.error.message, /exceed customer model maximum/);
+    assert.equal(
+      fake.requests.filter((entry) => entry.method === "thread/start").length,
+      1,
+      "there is no prior history to shed, so a second thread would overflow the same way"
+    );
+  } finally {
+    fake.close();
+  }
+});
+
+test("a resumed thread failing turn 1 with a NON-overflow error does not fall back", async () => {
+  const cwd = makeTempDir("codex-inv-overflow-other-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    const first = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      persistThread: true,
+      threadName: "Codex Companion Review: test"
+    });
+    assert.ok(first.threadId);
+
+    // Any other fatal turn error may already have been billed, so the fallback
+    // must stay keyed on the overflow signature rather than on "turn 1 failed".
+    fake.queueTurnResponse({ finalAnswer: null, turnError: { message: "Connection lost; giving up." } });
+
+    const second = await runAppServerInvestigation(fake.cwd, {
+      buildInvestigatePrompt: ({ resumed }) => (resumed ? "RESUMED" : "FRESH"),
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      resumeThreadId: first.threadId,
+      persistThread: true,
+      threadName: "Codex Companion Review: test"
+    });
+
+    assert.notEqual(second.status, 0);
+    assert.match(second.error.message, /Connection lost/);
+    assert.equal(second.threadId, first.threadId, "the failure stays on the resumed thread");
+    assert.equal(
+      fake.requests.filter((entry) => entry.method === "thread/start").length,
+      1,
+      "only run 1's thread exists; a non-overflow error must not open a fresh one"
+    );
+  } finally {
+    fake.close();
+  }
+});

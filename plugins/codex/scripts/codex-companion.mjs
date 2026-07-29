@@ -16,6 +16,7 @@ import {
     getSessionRuntimeStatus,
     importExternalAgentSession,
     interruptAppServerTurn,
+    isContextOverflowError,
     parseStructuredOutput,
     readOutputSchema,
     resolveReviewTurnIdleTimeoutMs,
@@ -594,19 +595,43 @@ async function executeReviewRun(request) {
         onProgress: trackInlineProgress
       });
     if (resumeThreadId) {
+      let resumeFailure = null;
       try {
         result = await runInlineReview(resumeThreadId);
+        // The overflow is rejected before the model runs and arrives as a turn
+        // error rather than a throw, so it reaches here as a completed call with
+        // a failed result. Left alone it would surface as a failed review over
+        // history bloat that a fresh thread simply does not carry.
+        if (result.error && isContextOverflowError(result.error.message)) {
+          resumeFailure = {
+            message:
+              "Resumed thread overflows the model context; falling back to a fresh thread.",
+            // An overflowed turn is provably zero-output, so re-running it
+            // cannot double-spend even though the thread was already announced.
+            ignoreThreadOpened: true
+          };
+        }
       } catch (error) {
         // Unlike runAppServerInvestigation, runAppServerTurn does not fall back
         // to a fresh thread when thread/resume fails, so the review caller has
         // to. A pruned or expired thread must cost a cold re-investigation, not
         // the whole review.
-        if (inlineThreadOpened) {
-          throw error;
+        resumeFailure = {
+          message: `Could not resume review thread ${resumeThreadId}; starting fresh.`,
+          // A turn that already opened may have been billed; re-running it on a
+          // fresh thread would silently double-spend, so only a resume that
+          // failed before any thread was announced is retriable here.
+          ignoreThreadOpened: isContextOverflowError(error?.message),
+          rethrow: error
+        };
+      }
+      if (resumeFailure) {
+        // `rethrow` is only absent on the non-thrown (turn-error) path, which
+        // always sets ignoreThreadOpened — so this never throws undefined.
+        if (resumeFailure.rethrow && inlineThreadOpened && !resumeFailure.ignoreThreadOpened) {
+          throw resumeFailure.rethrow;
         }
-        request.onProgress?.(
-          `Could not resume review thread ${resumeThreadId}; starting fresh.`
-        );
+        request.onProgress?.(resumeFailure.message);
         result = await runInlineReview(null);
       }
     } else {

@@ -2669,6 +2669,14 @@ function setupResumeReviewRepo() {
       state.queue.push({ hangAfterStarted: true });
       fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
     },
+    // A turn that fails with a specific error message and no output. The
+    // measured context-overflow arrived exactly this way: an `error`
+    // notification on a turn that produced nothing.
+    queueTurnError(message) {
+      const state = readFakeState();
+      state.queue.push({ finalAnswer: null, turnError: { message } });
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
     // The resolver reads the state index while /codex:status reads the per-job
     // file, so assertions about a job's tags have to be able to check both.
     readReviewJobFile(jobId) {
@@ -3148,6 +3156,43 @@ test("an inline-diff --resume run does not re-run a turn that already started", 
     requests.filter((entry) => entry.method === "turn/start").length,
     1,
     "the billed turn must be attempted exactly once"
+  );
+});
+
+test("an inline-diff --resume run whose turn overflows the context falls back to a fresh thread", () => {
+  // The inline guard keys on "was a thread ever announced", which is true by the
+  // time an overflow surfaces: thread/resume succeeded and the turn opened. But
+  // an overflow is provably zero-output — the prompt was rejected before the
+  // model ran — so re-running it fresh cannot double-spend, and the alternative
+  // is handing the user a failed review over recoverable history bloat.
+  const fixture = setupResumeReviewRepo();
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+  const lineageThreadId = fixture.readReviewJobs()[0].threadId;
+  assert.ok(lineageThreadId);
+
+  fixture.shrinkToInlineDiff();
+  fixture.clearRequests();
+  fixture.queueTurnError("prompt tokens (278972) exceed customer model maximum (278528)");
+  fixture.queueOneInlineReview();
+  const second = fixture.runReview(["--resume"]);
+  assert.equal(second.status, 0, `the overflow must not fail the review: ${second.stderr}`);
+
+  const requests = fixture.requests;
+  assert.equal(requests.filter((entry) => entry.method === "thread/resume").length, 1);
+  const starts = requests.filter((entry) => entry.method === "thread/start");
+  assert.equal(starts.length, 1, "the overflow must open exactly one fresh thread");
+  assert.equal(starts[0].params.ephemeral, false, "the fallback thread stays persistent");
+  assert.equal(requests.filter((entry) => entry.method === "turn/start").length, 2);
+
+  const job = fixture.readReviewJobs()[0];
+  assert.equal(job.status, "completed");
+  assert.ok(job.threadId, "the fallback run must record a thread id");
+  assert.notEqual(
+    job.threadId,
+    lineageThreadId,
+    "the job must record the FRESH thread, or the next --resume would overflow again"
   );
 });
 
