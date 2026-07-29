@@ -17,6 +17,14 @@ const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 // follow-up turns for anything it needs beyond it. 1MB is a safe share of a
 // 272K-token context window.
 const DEFAULT_INVESTIGATION_INLINE_MAX_BYTES = 1024 * 1024;
+// Aggregate ceiling on embedded untracked content for the blind self-collect
+// path. The fed and single-shot paths bound untracked bytes through their own
+// budgets (see collectReviewContext), but the blind path has no diff budget to
+// borrow — and it still embeds untracked bodies, because untracked files are
+// invisible to the git commands the model would otherwise run. Without a cap,
+// an arbitrarily large untracked payload rides the fallback that over-budget
+// reviews route to.
+const DEFAULT_UNTRACKED_INLINE_MAX_BYTES = 256 * 1024;
 
 // Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
 function git(cwd, args, options = {}) {
@@ -52,6 +60,14 @@ function normalizeInvestigationInlineMaxBytes(value) {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return DEFAULT_INVESTIGATION_INLINE_MAX_BYTES;
+  }
+  return Math.floor(parsed);
+}
+
+function normalizeUntrackedInlineMaxBytes(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_UNTRACKED_INLINE_MAX_BYTES;
   }
   return Math.floor(parsed);
 }
@@ -244,49 +260,103 @@ function classifyUntrackedFile(cwd, relativePath) {
   return { content: buffer.toString("utf8").trimEnd() };
 }
 
-// True when at least one untracked file's contents cannot be embedded inline.
-// An untracked file never appears in `git diff`, so a single skipped untracked
-// file otherwise looks like a 1-file, 0-byte diff and slips onto the inline
-// path — where the prompt embeds only a `(skipped: ...)` marker and forbids
-// shell, leaving the reviewer nothing to inspect.
-function hasSkippedUntrackedContent(cwd, untracked) {
-  return untracked.some((file) => Boolean(classifyUntrackedFile(cwd, file).skipped));
+// Classifies every untracked file exactly once and returns everything the rest
+// of a working-tree review needs: the per-file verdicts (so the formatter never
+// re-reads the tree), the aggregate embeddable size, and whether anything was
+// skipped. Three consumers used to each walk the untracked set independently;
+// funnelling them through one result keeps the review to a single stat/read pass
+// no matter how many untracked files the tree holds.
+//
+// `embeddableBytes` counts only content that will actually be embedded. Skipped
+// files contribute a short `(skipped: ...)` marker instead, bounded by the path
+// length, which the budgets treat as free.
+function summarizeUntrackedFiles(cwd, untracked) {
+  const entries = untracked.map((relativePath) => ({
+    relativePath,
+    ...classifyUntrackedFile(cwd, relativePath)
+  }));
+
+  let embeddableBytes = 0;
+  let hasSkipped = false;
+  for (const entry of entries) {
+    if (entry.skipped) {
+      // An untracked file never appears in `git diff`, so a single skipped
+      // untracked file otherwise looks like a 1-file, 0-byte diff and slips onto
+      // the inline path — where the prompt embeds only a `(skipped: ...)` marker
+      // and forbids shell, leaving the reviewer nothing to inspect.
+      hasSkipped = true;
+      continue;
+    }
+    embeddableBytes += Buffer.byteLength(entry.content, "utf8");
+  }
+
+  return { entries, embeddableBytes, hasSkipped };
 }
 
-function formatUntrackedFile(cwd, relativePath) {
-  const classified = classifyUntrackedFile(cwd, relativePath);
-  if (classified.skipped) {
-    return `### ${relativePath}\n(skipped: ${classified.skipped})`;
+// Embeds untracked bodies in order until `maxBytes` is exhausted, then reports
+// the remainder as one manifest line instead. Stopping at the first file that
+// does not fit (rather than packing later small ones) keeps the embedded set a
+// predictable prefix, so "N more" is literally the tail.
+//
+// Dropping the overflow silently would hide entire new files from the review, so
+// the omission line names the cost and the recovery. The reviewer can still see
+// every filename in `## Git Status`, which lists untracked files exhaustively.
+function formatUntrackedSection(entries, maxBytes) {
+  const blocks = [];
+  let usedBytes = 0;
+  let omittedFiles = 0;
+  let omittedBytes = 0;
+
+  for (const entry of entries) {
+    if (entry.skipped) {
+      blocks.push(`### ${entry.relativePath}\n(skipped: ${entry.skipped})`);
+      continue;
+    }
+    const contentBytes = Buffer.byteLength(entry.content, "utf8");
+    if (omittedFiles === 0 && usedBytes + contentBytes <= maxBytes) {
+      usedBytes += contentBytes;
+      blocks.push([`### ${entry.relativePath}`, "```", entry.content, "```"].join("\n"));
+      continue;
+    }
+    omittedFiles += 1;
+    omittedBytes += contentBytes;
   }
-  return [`### ${relativePath}`, "```", classified.content, "```"].join("\n");
+
+  if (omittedFiles > 0) {
+    blocks.push(
+      `(omitted: ${omittedFiles} more untracked files, ${omittedBytes} bytes — read them directly with read-only commands)`
+    );
+  }
+
+  return { body: blocks.join("\n\n"), omittedFiles };
 }
 
 function collectWorkingTreeContext(cwd, state, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
   const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
+  const untrackedEntries = options.untrackedEntries ?? summarizeUntrackedFiles(cwd, state.untracked).entries;
+  const untracked = formatUntrackedSection(untrackedEntries, options.untrackedMaxBytes ?? Infinity);
 
   let parts;
   if (includeDiff) {
     const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
     const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff", stagedDiff),
       formatSection("Unstaged Diff", unstagedDiff),
-      formatSection("Untracked Files", untrackedBody)
+      formatSection("Untracked Files", untracked.body)
     ];
   } else {
     const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
     const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),
       formatSection("Unstaged Diff Stat", unstagedStat),
       formatSection("Changed Files", changedFiles.join("\n")),
-      formatSection("Untracked Files", untrackedBody)
+      formatSection("Untracked Files", untracked.body)
     ];
   }
 
@@ -294,7 +364,8 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
     mode: "working-tree",
     summary: `Reviewing ${state.staged.length} staged, ${state.unstaged.length} unstaged, and ${state.untracked.length} untracked file(s).`,
     content: parts.join("\n"),
-    changedFiles
+    changedFiles,
+    untrackedContentOmitted: untracked.omittedFiles > 0
   };
 }
 
@@ -345,7 +416,16 @@ function buildAdversarialCollectionGuidance(options = {}) {
     return fed;
   }
 
-  return "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
+  const blind =
+    "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
+  // Untracked files are absent from every git diff, so the summary is the only
+  // place they appear at all. If some bodies were omitted for size, say so — the
+  // blind wording already sends the model to `git` commands that cannot surface
+  // them, and it needs to know to read those files instead.
+  if (options.untrackedContentOmitted) {
+    return `${blind} Some untracked file contents were omitted for size — read those files directly with read-only commands.`;
+  }
+  return blind;
 }
 
 export function collectReviewContext(cwd, target, options = {}) {
@@ -354,6 +434,7 @@ export function collectReviewContext(cwd, target, options = {}) {
   const maxInlineFiles = normalizeMaxInlineFiles(options.maxInlineFiles);
   const maxInlineDiffBytes = normalizeMaxInlineDiffBytes(options.maxInlineDiffBytes);
   const investigationInlineMaxBytes = normalizeInvestigationInlineMaxBytes(options.investigationInlineMaxBytes);
+  const untrackedInlineMaxBytes = normalizeUntrackedInlineMaxBytes(options.untrackedInlineMaxBytes);
   // Measure up to whichever budget is larger so a diff that overflows the
   // single-shot cap still yields a real byte count for the investigation check.
   const measureCap = Math.max(maxInlineDiffBytes, investigationInlineMaxBytes);
@@ -368,15 +449,15 @@ export function collectReviewContext(cwd, target, options = {}) {
 
   if (target.mode === "working-tree") {
     const state = getWorkingTreeState(repoRoot);
-    // hasSkippedUntrackedContent() stats and reads every untracked file, and two
-    // decisions below consult it. Memoize so it runs at most once, and keep it
-    // lazy so neither decision pays for it when a cheaper conjunct already lost.
-    let skippedUntracked = null;
-    const hasSkippedUntracked = () => {
-      if (skippedUntracked === null) {
-        skippedUntracked = hasSkippedUntrackedContent(repoRoot, state.untracked);
+    // Stats and reads every untracked file, and four things below consult the
+    // result. Memoize so it runs at most once, and keep it lazy so nothing pays
+    // for it when a cheaper conjunct already lost.
+    let untrackedSummary = null;
+    const summarizeUntracked = () => {
+      if (untrackedSummary === null) {
+        untrackedSummary = summarizeUntrackedFiles(repoRoot, state.untracked);
       }
-      return skippedUntracked;
+      return untrackedSummary;
     };
     diffBytes = measureCombinedGitOutputBytes(
       repoRoot,
@@ -386,20 +467,34 @@ export function collectReviewContext(cwd, target, options = {}) {
       ],
       measureCap
     );
+    // Untracked files never appear in `git diff`, so diffBytes alone understates
+    // an inline prompt that also embeds their bodies verbatim — by an unbounded
+    // margin, since only a per-file cap applies to them. Both inline budgets
+    // therefore weigh the total payload, not just the diff.
     singleShotInline =
       options.includeDiff ??
       (listUniqueFiles(state.staged, state.unstaged, state.untracked).length <= maxInlineFiles &&
         diffBytes <= maxInlineDiffBytes &&
-        !hasSkippedUntracked());
-    // Only the byte bound matters here: skipped untracked content is fine
-    // because the multi-turn path still has read-only shell to inspect it.
+        !summarizeUntracked().hasSkipped &&
+        diffBytes + summarizeUntracked().embeddableBytes <= maxInlineDiffBytes);
+    // Skipped untracked content does not block the fed path the way it blocks
+    // single-shot: the multi-turn path still has read-only shell to inspect it.
     investigationInline =
-      options.includeDiff === undefined && !singleShotInline && diffBytes <= investigationInlineMaxBytes;
+      options.includeDiff === undefined &&
+      !singleShotInline &&
+      diffBytes <= investigationInlineMaxBytes &&
+      diffBytes + summarizeUntracked().embeddableBytes <= investigationInlineMaxBytes;
     // The fed diff is then incomplete, so the guidance must say so rather than
     // claim the embedded diff is the whole change.
-    fedDiffOmitsUntracked = investigationInline && hasSkippedUntracked();
+    fedDiffOmitsUntracked = investigationInline && summarizeUntracked().hasSkipped;
     details = collectWorkingTreeContext(repoRoot, state, {
-      includeDiff: singleShotInline || investigationInline
+      includeDiff: singleShotInline || investigationInline,
+      untrackedEntries: summarizeUntracked().entries,
+      // On the inline paths the gates above already proved the whole untracked
+      // set fits, so this cap is inert there and truncation can only ever fire
+      // on the blind fallback — the one path with no diff budget of its own.
+      untrackedMaxBytes:
+        singleShotInline || investigationInline ? Infinity : untrackedInlineMaxBytes
     });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
@@ -430,7 +525,8 @@ export function collectReviewContext(cwd, target, options = {}) {
     collectionGuidance: buildAdversarialCollectionGuidance({
       includeDiff: singleShotInline,
       investigationInline,
-      hasSkippedUntracked: fedDiffOmitsUntracked
+      hasSkippedUntracked: fedDiffOmitsUntracked,
+      untrackedContentOmitted: Boolean(details.untrackedContentOmitted)
     }),
     ...details
   };

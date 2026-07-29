@@ -494,6 +494,134 @@ test("fed branch-mode guidance keeps the unqualified wording (no untracked conce
   assert.doesNotMatch(context.collectionGuidance, /could not be embedded/i);
 });
 
+// Untracked files are the one kind of change `git diff` never reports, so their
+// embedded bodies are invisible to any budget measured from diff output. Seeds a
+// one-line tracked edit (a ~130 byte diff) plus `count` untracked files of
+// exactly `bytes` embeddable bytes each — every file under MAX_UNTRACKED_BYTES
+// (24 KiB) so none is skipped, and each carrying a unique body marker so a test
+// can tell an embedded body from the file's name in `## Git Status`.
+function seedUntrackedBulk(cwd, count, bytes) {
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'v1';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'v2';\n");
+  for (let index = 0; index < count; index += 1) {
+    const marker = `BODY_MARKER_${index}_`;
+    // No trailing whitespace: classifyUntrackedFile trimEnd()s the content, so
+    // this keeps embeddable bytes exactly equal to `bytes` for budget math.
+    fs.writeFileSync(path.join(cwd, `note-${index}.txt`), marker + "u".repeat(bytes - marker.length));
+  }
+}
+
+test("many small untracked files push a working-tree review off the fed path", () => {
+  // Each file is under the per-file 24 KiB cap, so nothing is skipped and the
+  // old gate saw only the 130-byte tracked diff — passing a 64 KiB budget while
+  // embedding 320 KiB of untracked bodies.
+  const cwd = makeTempDir();
+  seedUntrackedBulk(cwd, 40, 8 * 1024);
+
+  const target = resolveReviewTarget(cwd, {});
+  const budget = 64 * 1024;
+  // maxInlineDiffBytes: 0 forces the single-shot path to lose, isolating the
+  // investigation budget as the only decision under test.
+  const options = { maxInlineDiffBytes: 0, investigationInlineMaxBytes: budget };
+  const context = collectReviewContext(cwd, target, options);
+
+  assert.equal(target.mode, "working-tree");
+  assert.ok(context.diffBytes <= budget, "the tracked diff alone is well inside the budget");
+  assert.equal(context.investigationInline, false,
+    "embedded untracked bodies must count against the investigation budget");
+
+  // Counterfactual: the same tracked diff with no untracked files IS fed, so the
+  // routing flip above is attributable to the untracked bytes and nothing else.
+  for (let index = 0; index < 40; index += 1) {
+    fs.rmSync(path.join(cwd, `note-${index}.txt`));
+  }
+  const withoutUntracked = collectReviewContext(cwd, target, options);
+  assert.equal(withoutUntracked.investigationInline, true);
+});
+
+test("untracked bytes exactly at the investigation budget are still fed", () => {
+  // Inclusive (`<=`) semantics, matching the diff-only boundary tests: the sum
+  // landing exactly on the budget must stay on the fed path.
+  const cwd = makeTempDir();
+  seedUntrackedBulk(cwd, 3, 4096);
+  const untrackedBytes = 3 * 4096;
+
+  const target = resolveReviewTarget(cwd, {});
+  // The default 1 MiB budget dwarfs this diff, so probe.diffBytes is the real
+  // measured size rather than the over-budget sentinel.
+  const probe = collectReviewContext(cwd, target);
+
+  const atBudget = collectReviewContext(cwd, target, {
+    investigationInlineMaxBytes: probe.diffBytes + untrackedBytes
+  });
+  assert.equal(atBudget.diffBytes, probe.diffBytes, "budget must be pinned to the real measured diff size");
+  assert.equal(atBudget.investigationInline, true, "exactly at the budget is within budget");
+  assert.match(atBudget.content, /BODY_MARKER_0_/);
+
+  const overBudget = collectReviewContext(cwd, target, {
+    investigationInlineMaxBytes: probe.diffBytes + untrackedBytes - 1
+  });
+  assert.equal(overBudget.investigationInline, false, "one byte over the total must stop feeding the diff");
+});
+
+test("the blind working-tree summary caps aggregate untracked content", () => {
+  // The blind path embeds untracked bodies too (they are invisible to the git
+  // commands the model would run), so without an aggregate cap the same
+  // unbounded payload rides the fallback and the budget is bypassed anyway.
+  const cwd = makeTempDir();
+  seedUntrackedBulk(cwd, 20, 8 * 1024);
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target, {
+    // Pins the review to the blind path without relying on diff size.
+    investigationInlineMaxBytes: 10,
+    untrackedInlineMaxBytes: 16 * 1024
+  });
+
+  assert.equal(context.investigationInline, false);
+  assert.match(context.content, /## Untracked Files/);
+  assert.match(context.content, /BODY_MARKER_0_/, "content up to the cap is still embedded");
+  assert.doesNotMatch(context.content, /BODY_MARKER_19_/, "bodies past the cap must not be embedded");
+  assert.match(context.content, /omitted: 18 more untracked files, \d+ bytes/);
+  // The names still appear in `## Git Status`, so the model knows what exists.
+  assert.match(context.content, /note-19\.txt/);
+  assert.ok(Buffer.byteLength(context.content, "utf8") < 64 * 1024,
+    `capped blind context must stay small, got ${Buffer.byteLength(context.content, "utf8")} bytes`);
+  assert.match(context.collectionGuidance, /lightweight summary/i);
+  assert.match(context.collectionGuidance, /omitted/i);
+});
+
+test("untracked bytes count against the single-shot inline cap too", () => {
+  // Only reachable with a raised file cap: at the default cap of 1 a tracked
+  // edit and an untracked file cannot both be present, so diffBytes is 0
+  // whenever untracked content is embedded. The gate must still be total-aware
+  // because the single-shot prompt forbids shell — whatever the caps let
+  // through is all the evidence the reviewer will ever get.
+  const cwd = makeTempDir();
+  seedUntrackedBulk(cwd, 2, 4096);
+  const untrackedBytes = 2 * 4096;
+
+  const target = resolveReviewTarget(cwd, {});
+  const probe = collectReviewContext(cwd, target, { maxInlineFiles: 5 });
+  assert.equal(probe.inputMode, "inline-diff", "everything fits the default 256 KiB single-shot cap");
+
+  const atCap = collectReviewContext(cwd, target, {
+    maxInlineFiles: 5,
+    maxInlineDiffBytes: probe.diffBytes + untrackedBytes
+  });
+  assert.equal(atCap.inputMode, "inline-diff", "exactly at the cap is within budget");
+
+  const overCap = collectReviewContext(cwd, target, {
+    maxInlineFiles: 5,
+    maxInlineDiffBytes: probe.diffBytes + untrackedBytes - 1
+  });
+  assert.equal(overCap.inputMode, "self-collect",
+    "untracked bodies must count against the single-shot byte cap");
+});
+
 test("a diff of exactly the single-shot byte cap still routes to inline-diff", () => {
   // Both budgets are inclusive (`<=`). Pin the cap to the diff's real measured
   // size: equal-to-cap must stay inline, so an off-by-one tightening to `<`
