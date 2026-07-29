@@ -1447,7 +1447,10 @@ const DEFAULT_MAX_INVESTIGATION_TURNS = 10;
 const INVESTIGATION_CONTINUATION_CUE = "Continue your investigation.";
 
 const DEFAULT_FINALIZE_EFFORT = "medium";
-const FINALIZE_EFFORT_VALUES = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+// Ordered cheapest-first: the index doubles as the comparison used to clamp a
+// caller's effort downward rather than upward.
+const FINALIZE_EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh"];
+const FINALIZE_EFFORT_VALUES = new Set(FINALIZE_EFFORT_ORDER);
 
 // A resumed thread carries its whole prior history into the next turn's prompt,
 // so a full-depth review can only be resumed until the accumulated history no
@@ -1478,15 +1481,24 @@ export function isContextOverflowError(message) {
 // The finalize turn translates already-formed conclusions into schema JSON —
 // mechanical work that does not benefit from a reasoning-heavy effort. Read at
 // call time (not import time) so the env override always takes effect.
+//
+// This only ever clamps DOWNWARD. A caller that already asked for less than the
+// target keeps its own value: raising it would spend more effort than asked
+// for, and is the one way this function could push a turn onto an effort level
+// the caller's model may not support.
 function resolveFinalizeEffort(callerEffort) {
   const raw = String(process.env.CODEX_COMPANION_FINALIZE_EFFORT ?? "").trim().toLowerCase();
   if (raw === "inherit") {
     return callerEffort ?? null;
   }
-  if (FINALIZE_EFFORT_VALUES.has(raw)) {
-    return raw;
-  }
-  return DEFAULT_FINALIZE_EFFORT;
+  const target = FINALIZE_EFFORT_VALUES.has(raw) ? raw : DEFAULT_FINALIZE_EFFORT;
+  const caller = String(callerEffort ?? "").trim().toLowerCase();
+  // An unknown or absent caller effort has no position in the order, so there
+  // is nothing to compare and the target stands.
+  const callerRank = FINALIZE_EFFORT_ORDER.indexOf(caller);
+  return callerRank >= 0 && callerRank < FINALIZE_EFFORT_ORDER.indexOf(target)
+    ? caller
+    : target;
 }
 
 export async function runAppServerInvestigation(cwd, options = {}) {

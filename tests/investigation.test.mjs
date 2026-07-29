@@ -1701,6 +1701,60 @@ test("finalize turn downgrades to medium effort while investigation keeps caller
   }
 });
 
+test("finalize clamps downward only: a low-effort caller is not upgraded to medium", async () => {
+  // The downgrade exists to stop a reasoning-heavy caller from spending xhigh
+  // on mechanical JSON formatting. A caller that already asked for LESS than
+  // the target must keep its own value: raising it would spend more than asked
+  // for, and would also be the one way this function can push a caller onto an
+  // effort level its model may not support.
+  const cwd = makeTempDir("codex-inv-effort-clamp-low-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "low"
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 2);
+    assert.equal(starts[0].params.effort, "low", "investigation turn keeps caller effort");
+    assert.equal(starts[1].params.effort, "low", "finalize must NOT upgrade a low caller to medium");
+  } finally {
+    fake.close();
+  }
+});
+
+test("finalize clamps below an explicit env override too", async () => {
+  // The clamp is about never spending more than the caller asked for, so it
+  // has to beat the env override as well — otherwise setting the override to
+  // `high` would silently upgrade every low-effort caller.
+  process.env.CODEX_COMPANION_FINALIZE_EFFORT = "high";
+  const cwd = makeTempDir("codex-inv-effort-clamp-env-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      effort: "low"
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.at(-1).params.effort, "low", "the clamp must beat the env override");
+  } finally {
+    delete process.env.CODEX_COMPANION_FINALIZE_EFFORT;
+    fake.close();
+  }
+});
+
 test("CODEX_COMPANION_FINALIZE_EFFORT=inherit keeps caller effort on finalize", async () => {
   process.env.CODEX_COMPANION_FINALIZE_EFFORT = "inherit";
   const cwd = makeTempDir("codex-inv-effort-inherit-");
