@@ -39,6 +39,25 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
+// A finished resumable review record is a CROSS-SESSION pointer by design: the
+// Codex thread it names lives on server-side, and resolveLatestReviewThread
+// offers it back for up to its recency window (3h by default), which routinely
+// outlives the Claude session that created it. Reaping it here would leave the
+// thread alive but unreachable, so a --resume in the next session silently
+// starts cold. These records are still bounded — the MAX_JOBS cap in saveState
+// prunes them by age and the resolver's recency window stops offering them — so
+// keeping them does not grow state without limit.
+//
+// Every terminal status is kept, not just "completed", because the resolver
+// picks the NEWEST resumable record and then decides: a failed or cancelled one
+// means "start fresh". Dropping it would promote an older record to newest and
+// resume a thread the newest run had already moved past. Everything else the
+// sweep removed before is still removed: non-resumable records, and the
+// queued/running ones terminated above.
+function isResumableThreadPointer(job) {
+  return job.resumable === true && job.status !== "queued" && job.status !== "running";
+}
+
 function cleanupSessionJobs(cwd, sessionId) {
   if (!cwd || !sessionId) {
     return;
@@ -51,12 +70,12 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
+  const sessionJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  if (sessionJobs.length === 0) {
     return;
   }
 
-  for (const job of removedJobs) {
+  for (const job of sessionJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
     if (!stillRunning) {
       continue;
@@ -70,7 +89,7 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   saveState(workspaceRoot, {
     ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    jobs: state.jobs.filter((job) => job.sessionId !== sessionId || isResumableThreadPointer(job))
   });
 }
 

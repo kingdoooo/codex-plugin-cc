@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { resolveLatestReviewThread } from "../plugins/codex/scripts/lib/review-threads.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1956,6 +1957,149 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
+});
+
+test("session end keeps completed resumable review records so the next session can resume them", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const resumableLog = path.join(jobsDir, "resumable.log");
+  const plainLog = path.join(jobsDir, "plain.log");
+  const runningLog = path.join(jobsDir, "running.log");
+  const resumableJobFile = path.join(jobsDir, "review-resumable.json");
+  const plainJobFile = path.join(jobsDir, "review-plain.json");
+  const runningJobFile = path.join(jobsDir, "review-running.json");
+  fs.writeFileSync(resumableLog, "resumable\n", "utf8");
+  fs.writeFileSync(plainLog, "plain\n", "utf8");
+  fs.writeFileSync(runningLog, "running\n", "utf8");
+  fs.writeFileSync(resumableJobFile, JSON.stringify({ id: "review-resumable" }, null, 2), "utf8");
+  fs.writeFileSync(plainJobFile, JSON.stringify({ id: "review-plain" }, null, 2), "utf8");
+  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const nowIso = new Date().toISOString();
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-resumable",
+            status: "completed",
+            jobClass: "review",
+            kind: "adversarial-review",
+            resumable: true,
+            threadId: "th_reusable",
+            title: "Codex Adversarial Review",
+            sessionId: "sess-current",
+            logFile: resumableLog,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            completedAt: nowIso
+          },
+          {
+            id: "review-plain",
+            status: "completed",
+            jobClass: "review",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            logFile: plainLog,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            completedAt: nowIso
+          },
+          {
+            id: "review-running",
+            status: "running",
+            jobClass: "review",
+            kind: "adversarial-review",
+            resumable: true,
+            threadId: "th_inflight",
+            title: "Codex Adversarial Review",
+            sessionId: "sess-current",
+            pid: sleeper.pid,
+            logFile: runningLog,
+            createdAt: nowIso,
+            updatedAt: nowIso
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  // The still-running job is terminated as before, resumable or not.
+  await waitFor(() => {
+    try {
+      process.kill(sleeper.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.deepEqual(
+    state.jobs.map((job) => job.id),
+    ["review-resumable"],
+    "only the completed resumable review record survives"
+  );
+  assert.equal(state.jobs[0].threadId, "th_reusable");
+
+  // Its sidecar files must survive too: saveState reaps the files of dropped jobs.
+  assert.equal(fs.existsSync(resumableJobFile), true);
+  assert.equal(fs.existsSync(resumableLog), true);
+  assert.equal(fs.existsSync(plainJobFile), false);
+  assert.equal(fs.existsSync(plainLog), false);
+  assert.equal(fs.existsSync(runningJobFile), false);
+  assert.equal(fs.existsSync(runningLog), false);
+
+  // The whole point: the next Claude session's resolver still finds the thread.
+  const resolved = resolveLatestReviewThread(repo, { kind: "adversarial-review" });
+  assert.equal(resolved?.id, "th_reusable");
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
