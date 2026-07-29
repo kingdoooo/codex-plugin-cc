@@ -157,6 +157,23 @@ function nextTurnId(state) {
   return turnId;
 }
 
+// Setup-RPC hang: a set of method names that must be received and then left
+// unanswered. One-shot per method (the name is consumed on use) so a test can
+// hang a resume and still let the fallback thread/start succeed.
+function hangSetupRpcOnce(state, method) {
+  const pending = state.hangSetupRpcs;
+  if (!Array.isArray(pending)) {
+    return false;
+  }
+  const index = pending.indexOf(method);
+  if (index === -1) {
+    return false;
+  }
+  pending.splice(index, 1);
+  saveState(state);
+  return true;
+}
+
 function importLedgerPath() {
   return path.join(process.env.CODEX_HOME || path.join(process.env.HOME, ".codex"), "external_agent_session_imports.json");
 }
@@ -322,6 +339,12 @@ rl.on("line", (line) => {
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
         }
+        // Half-dead upstream on a SETUP rpc: the request is received and
+        // recorded, but never answered. Nothing else follows, so the client's
+        // own request deadline is the only thing that can end the wait.
+        if (hangSetupRpcOnce(state, "thread/start")) {
+          break;
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
@@ -333,6 +356,9 @@ rl.on("line", (line) => {
 
       case "thread/name/set": {
         recordRequest(state, message);
+        if (hangSetupRpcOnce(state, "thread/name/set")) {
+          break;
+        }
         const thread = ensureThread(state, message.params.threadId);
         thread.name = message.params.name;
         thread.updatedAt = now();
@@ -356,6 +382,9 @@ rl.on("line", (line) => {
 
       case "thread/resume": {
         recordRequest(state, message);
+        if (hangSetupRpcOnce(state, "thread/resume")) {
+          break;
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
@@ -874,7 +903,8 @@ export function setupFakeCodex({ cwd } = {}) {
     lastInterrupt: null,
     queue: [],
     requests: [],
-    serialize: false
+    serialize: false,
+    hangSetupRpcs: []
   };
   fs.writeFileSync(statePath, JSON.stringify(initialState, null, 2));
 
@@ -920,6 +950,16 @@ export function setupFakeCodex({ cwd } = {}) {
       const state = readState();
       if (!state.queue) { state.queue = []; }
       state.queue.push({ hangAfterStarted: true });
+      writeState(state);
+    },
+    // Make the next call to `method` (a thread-setup RPC) go unanswered. Unlike
+    // the turn queue this is keyed by method name, because setup RPCs are not
+    // drawn from the turn queue. One-shot: a later call to the same method is
+    // served normally, which is what a resume-then-fallback test needs.
+    hangSetupRpc(method) {
+      const state = readState();
+      if (!Array.isArray(state.hangSetupRpcs)) { state.hangSetupRpcs = []; }
+      state.hangSetupRpcs.push(method);
       writeState(state);
     },
     enableSerialization() {

@@ -78,22 +78,72 @@ class AppServerClientBase {
   }
 
   /**
+   * A request is settled by a matching reply or by process/socket death, so an
+   * upstream that receives the request and never answers leaves the promise
+   * pending forever. `timeoutMs` bounds that: it is opt-in because the streaming
+   * methods (turn/start, review/start) are already bounded by captureTurn's
+   * watchdogs and must not be cut off by a second, blunter deadline. Callers
+   * that run outside any watchdog — the thread setup RPCs — pass one.
+   *
    * @template {AppServerMethod} M
    * @param {M} method
    * @param {import("./app-server-protocol").AppServerRequestParams<M>} params
+   * @param {{ timeoutMs?: number }} [options]
    * @returns {Promise<import("./app-server-protocol").AppServerResponse<M>>}
    */
-  request(method, params) {
+  request(method, params, options = {}) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
     }
 
     const id = this.nextId;
     this.nextId += 1;
+    const timeoutMs = Number(options.timeoutMs);
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      let timer = null;
+      const clearDeadline = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+      // handleLine and handleExit settle through these, so any reply — result,
+      // error, or connection death — also disarms the deadline.
+      const entry = {
+        method,
+        resolve: (value) => {
+          clearDeadline();
+          resolve(value);
+        },
+        reject: (error) => {
+          clearDeadline();
+          reject(error);
+        }
+      };
+      this.pending.set(id, entry);
       this.sendMessage({ id, method, params });
+
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        return;
+      }
+      timer = setTimeout(() => {
+        timer = null;
+        // Identity check, not just presence: a reply that raced the deadline has
+        // already deleted the entry, and firing on anything else would settle a
+        // request that is not ours.
+        if (this.pending.get(id) !== entry) {
+          return;
+        }
+        this.pending.delete(id);
+        reject(
+          Object.assign(new Error(`codex app-server ${method} timed out after ${timeoutMs}ms.`), {
+            rpcTimedOut: true,
+            rpcMethod: method
+          })
+        );
+      }, timeoutMs);
+      timer.unref?.();
     });
   }
 

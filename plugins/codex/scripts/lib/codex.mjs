@@ -137,6 +137,23 @@ export function resolveTurnCeilingMs() {
   return DEFAULT_TURN_CEILING_MS;
 }
 
+// Thread setup runs BEFORE captureTurn arms any watchdog, so a hung thread/start
+// or thread/resume would hang the whole run with every turn guard above still
+// unarmed. These RPCs are pure bookkeeping — no model work — so a healthy one
+// answers in well under a second even on a slow backend; 60s is generous
+// headroom for a cold app-server or a contended broker, not a work budget.
+// Read at call time so a test (or a user on a pathologically slow machine) can
+// override it per-run.
+const DEFAULT_SETUP_RPC_TIMEOUT_MS = 60_000;
+
+export function resolveSetupRpcTimeoutMs() {
+  const fromEnv = Number(process.env.CODEX_COMPANION_SETUP_RPC_TIMEOUT_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  return DEFAULT_SETUP_RPC_TIMEOUT_MS;
+}
+
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 
@@ -992,17 +1009,29 @@ async function requestExternalAgentSessionImport(client, params) {
 }
 
 async function startThread(client, cwd, options = {}) {
-  const response = await client.request("thread/start", buildThreadParams(cwd, options));
+  const timeoutMs = resolveSetupRpcTimeoutMs();
+  const response = await client.request("thread/start", buildThreadParams(cwd, options), { timeoutMs });
   const threadId = response.thread.id;
   if (options.threadName) {
     try {
-      await client.request("thread/name/set", { threadId, name: options.threadName });
+      await client.request("thread/name/set", { threadId, name: options.threadName }, { timeoutMs });
     } catch (err) {
-      // Only suppress "unknown variant/method" errors from older CLI versions
-      // that don't support thread/name/set. Rethrow auth, network, or server errors.
-      const msg = String(err?.message ?? err ?? "");
-      if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
-        throw err;
+      // The thread already exists and is persistent at this point; the name is
+      // only there to make it findable in `codex resume`. So neither an older
+      // CLI that lacks the method nor a hung one is worth failing the run for —
+      // degrade to unnamed-but-persistent. Every other error (auth, network,
+      // server) still aborts.
+      if (err?.rpcTimedOut) {
+        emitProgress(
+          options.onProgress,
+          `Naming the thread timed out; continuing with an unnamed persistent thread (${threadId}).`,
+          "starting"
+        );
+      } else {
+        const msg = String(err?.message ?? err ?? "");
+        if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
+          throw err;
+        }
       }
     }
   }
@@ -1010,7 +1039,9 @@ async function startThread(client, cwd, options = {}) {
 }
 
 async function resumeThread(client, threadId, cwd, options = {}) {
-  return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+  return client.request("thread/resume", buildResumeParams(threadId, cwd, options), {
+    timeoutMs: resolveSetupRpcTimeoutMs()
+  });
 }
 
 function buildResultStatus(turnState) {
@@ -1289,7 +1320,8 @@ export async function runAppServerReview(cwd, options = {}) {
       model: options.model,
       sandbox: "read-only",
       ephemeral: true,
-      threadName: options.threadName
+      threadName: options.threadName,
+      onProgress: options.onProgress
     });
     const sourceThreadId = thread.thread.id;
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
@@ -1399,7 +1431,8 @@ export async function runAppServerTurn(cwd, options = {}) {
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName : options.threadName ?? null
+        threadName: options.persistThread ? options.threadName : options.threadName ?? null,
+        onProgress: options.onProgress
       });
       threadId = response.thread.id;
     }
@@ -1540,7 +1573,8 @@ export async function runAppServerInvestigation(cwd, options = {}) {
         // Session mode (persistThread) keeps the thread resumable across runs
         // and broker restarts; the default stays ephemeral and unnamed.
         ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName ?? null : null
+        threadName: options.persistThread ? options.threadName ?? null : null,
+        onProgress: options.onProgress
       });
       return response.thread.id;
     };

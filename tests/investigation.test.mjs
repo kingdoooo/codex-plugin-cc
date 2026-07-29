@@ -2178,3 +2178,132 @@ test("a resumed thread failing turn 1 with a NON-overflow error does not fall ba
     fake.close();
   }
 });
+
+// -------------------------------------------------------------------
+// Thread setup RPCs are bounded (they run before captureTurn arms anything)
+// -------------------------------------------------------------------
+
+// Small enough to keep these tests fast; captureTurn's own guards are untouched
+// and stay at their real defaults, so a leak into the turn path would show up as
+// a multi-minute test rather than a silent pass.
+const SETUP_TIMEOUT_ENV = "CODEX_COMPANION_SETUP_RPC_TIMEOUT_MS";
+
+function withShortSetupTimeout(t, ms = 300) {
+  const previous = process.env[SETUP_TIMEOUT_ENV];
+  process.env[SETUP_TIMEOUT_ENV] = String(ms);
+  t.after(() => {
+    if (previous === undefined) {
+      delete process.env[SETUP_TIMEOUT_ENV];
+    } else {
+      process.env[SETUP_TIMEOUT_ENV] = previous;
+    }
+  });
+}
+
+test("a hung thread/start fails the run with a timeout instead of hanging", async (t) => {
+  const cwd = makeTempDir("codex-inv-setup-start-hang-");
+  const fake = setupFakeCodex({ cwd });
+  withShortSetupTimeout(t);
+  try {
+    fake.hangSetupRpc("thread/start");
+
+    const startedAt = Date.now();
+    await assert.rejects(
+      () =>
+        runAppServerInvestigation(fake.cwd, {
+          investigatePrompt: "Investigate.",
+          finalizePrompt: "Finalize.",
+          outputSchema: { type: "object", required: ["verdict"] }
+        }),
+      /thread\/start timed out after 300ms/
+    );
+    // There is nothing to fall back to, so this is the whole run failing — but
+    // it must fail promptly, not wait for a turn watchdog that never armed.
+    assert.ok(Date.now() - startedAt < 30_000, "the deadline, not an external kill, ended the run");
+    assert.equal(
+      fake.requests.filter((entry) => entry.method === "turn/start").length,
+      0,
+      "no turn can start without a thread"
+    );
+  } finally {
+    fake.close();
+  }
+});
+
+test("a hung thread/resume falls back to a fresh thread and completes", async (t) => {
+  const cwd = makeTempDir("codex-inv-setup-resume-hang-");
+  const fake = setupFakeCodex({ cwd });
+  withShortSetupTimeout(t);
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    fake.hangSetupRpc("thread/resume");
+
+    const progress = [];
+    const result = await runAppServerInvestigation(fake.cwd, {
+      buildInvestigatePrompt: ({ resumed }) => (resumed ? "RESUMED" : "FRESH"),
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      resumeThreadId: "thr_gone",
+      persistThread: true,
+      threadName: "Codex Companion Review: test",
+      onProgress: (event) => {
+        progress.push(typeof event === "string" ? event : event?.message ?? "");
+      }
+    });
+
+    // The timeout surfaces as a rejected thread/resume, which the existing
+    // resume try/catch already treats as "this thread is unusable — start fresh".
+    assert.equal(result.status, 0, "a hung resume must not fail the run");
+    assert.ok(fake.requests.some((entry) => entry.method === "thread/resume"), "resume was attempted");
+    assert.equal(
+      fake.requests.filter((entry) => entry.method === "thread/start").length,
+      1,
+      "exactly one fresh thread replaces the unreachable one"
+    );
+    const investigate = fake.requests.filter((entry) => entry.method === "turn/start")[0];
+    assert.match(JSON.stringify(investigate.params.input), /FRESH/);
+    assert.ok(
+      progress.some((message) => /starting fresh/i.test(message)),
+      `the fallback must be announced, got: ${JSON.stringify(progress)}`
+    );
+  } finally {
+    fake.close();
+  }
+});
+
+test("a hung thread/name/set leaves the run going on an unnamed persistent thread", async (t) => {
+  const cwd = makeTempDir("codex-inv-setup-name-hang-");
+  const fake = setupFakeCodex({ cwd });
+  withShortSetupTimeout(t);
+  try {
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: APPROVE_REVIEW } });
+    fake.hangSetupRpc("thread/name/set");
+
+    const progress = [];
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      persistThread: true,
+      threadName: "Codex Companion Review: test",
+      onProgress: (event) => {
+        progress.push(typeof event === "string" ? event : event?.message ?? "");
+      }
+    });
+
+    // Thread creation already succeeded; naming is only there to make the thread
+    // findable in `codex resume`, so losing it must not cost the run.
+    assert.equal(result.status, 0, "naming is a nicety, not a prerequisite");
+    assert.ok(result.threadId, "the thread is still usable and resumable");
+    const start = fake.requests.find((entry) => entry.method === "thread/start");
+    assert.equal(start.params.ephemeral, false, "the thread stays persistent");
+    assert.ok(
+      progress.some((message) => /unnamed/i.test(message)),
+      `the degraded naming must be announced, got: ${JSON.stringify(progress)}`
+    );
+  } finally {
+    fake.close();
+  }
+});
