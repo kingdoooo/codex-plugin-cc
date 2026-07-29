@@ -2641,6 +2641,14 @@ function setupResumeReviewRepo() {
       }
       fs.writeFileSync(path.join(repo, "src", "a.js"), 'export const value = "a.js-inline";\n');
     },
+    // Commits everything so the working tree is clean. On the default branch
+    // that makes the branch comparison resolve merge-base == HEAD, so the next
+    // review sees an empty diff and short-circuits to an approve verdict
+    // without ever opening a thread.
+    commitWorkingTree(message) {
+      run("git", ["add", "-A"], { cwd: repo });
+      run("git", ["commit", "-m", message], { cwd: repo });
+    },
     // Restores the three-file working tree so the review routes back through
     // the multi-turn self-collect branch.
     growToSelfCollect(marker) {
@@ -2660,6 +2668,13 @@ function setupResumeReviewRepo() {
       const state = readFakeState();
       state.queue.push({ hangAfterStarted: true });
       fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
+    // The resolver reads the state index while /codex:status reads the per-job
+    // file, so assertions about a job's tags have to be able to check both.
+    readReviewJobFile(jobId) {
+      return JSON.parse(
+        fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${jobId}.json`), "utf8")
+      );
     },
     // Rewrites the stored completedAt of every review job in both the state
     // index and the per-job file, so the recency window sees a stale thread.
@@ -2942,6 +2957,107 @@ test("an inline-diff --resume run joins the same thread lineage as self-collect 
   // Every job in the chain points at the one persistent thread, so no run
   // recorded a resumable job against a thread nobody can resume.
   assert.ok(jobs.every((job) => job.threadId === lineageThreadId));
+});
+
+test("an empty-diff --resume run does not shadow the thread lineage", () => {
+  // Regression: the empty-verdict short-circuit returns before any thread is
+  // opened, but the job record was already tagged resumable at creation. The
+  // reuse resolver only ever looks at the NEWEST resumable job and bails when
+  // it carries no threadId (a deliberate concurrency guard), so a clean-tree
+  // review permanently shadowed the real lineage. Committing or stashing
+  // between review passes is the ordinary trigger.
+  const fixture = setupResumeReviewRepo();
+
+  // Run 1: three changed files -> self-collect, opens the persistent thread.
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+  const lineageThreadId = fixture.readReviewJobs()[0].threadId;
+  assert.ok(lineageThreadId);
+
+  // Run 2: clean tree on the default branch -> empty diff, no thread at all.
+  fixture.commitWorkingTree("land the reviewed work");
+  fixture.clearRequests();
+  const second = fixture.runReview(["--resume"]);
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(
+    fixture.requests.length,
+    0,
+    "an empty diff must not reach the model at all"
+  );
+  const emptyJob = fixture.readReviewJobs()[0];
+  assert.equal(emptyJob.status, "completed");
+  assert.ok(!emptyJob.threadId, "the short-circuit never opened a thread");
+
+  // Run 3: dirty the tree again. It must rejoin run 1's lineage rather than
+  // silently starting over because the clean-tree job shadowed it.
+  fixture.growToSelfCollect("v3");
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  const third = fixture.runReview(["--resume"]);
+  assert.equal(third.status, 0, third.stderr);
+
+  const requests = fixture.requests;
+  const resumes = requests.filter((entry) => entry.method === "thread/resume");
+  assert.equal(resumes.length, 1, "run 3 must resume rather than start fresh");
+  assert.equal(
+    resumes[0].params.threadId,
+    lineageThreadId,
+    "run 3 must resume the original lineage the clean-tree run used to shadow"
+  );
+  assert.ok(
+    !requests.some((entry) => entry.method === "thread/start"),
+    "resuming must not open a new thread"
+  );
+
+  // And the underlying cause: the short-circuited job must not remain a reuse
+  // candidate at all, since the resolver would stop at it again. The per-job
+  // file has to agree with the index it is read alongside.
+  assert.notEqual(
+    emptyJob.resumable,
+    true,
+    "a run that never opened a thread must not stay tagged as a reuse candidate"
+  );
+  assert.notEqual(fixture.readReviewJobFile(emptyJob.id).resumable, true);
+});
+
+test("a --resume run that fails before opening a thread does not shadow the lineage", () => {
+  // Same shape as the empty-diff short-circuit: the job is tagged resumable at
+  // creation, then the run dies before any thread exists (here a bad --base, so
+  // it throws while resolving the diff and never reaches Codex). The resolver
+  // stops at the newest resumable job and bails on its missing threadId, so a
+  // single mistyped ref would otherwise strand the whole accumulated lineage.
+  const fixture = setupResumeReviewRepo();
+
+  fixture.queueOneReview();
+  const first = fixture.runReview(["--resume"]);
+  assert.equal(first.status, 0, first.stderr);
+  const lineageThreadId = fixture.readReviewJobs()[0].threadId;
+  assert.ok(lineageThreadId);
+
+  fixture.clearRequests();
+  const failed = fixture.runReview(["--resume", "--base", "no-such-ref-xyz"]);
+  assert.notEqual(failed.status, 0, "a bad base ref must surface as a failure");
+  assert.equal(fixture.requests.length, 0, "the run never reached Codex");
+  const failedJob = fixture.readReviewJobs()[0];
+  assert.equal(failedJob.status, "failed");
+  assert.ok(!failedJob.threadId, "the failed run never opened a thread");
+  assert.notEqual(
+    failedJob.resumable,
+    true,
+    "a failed run that never opened a thread must not stay a reuse candidate"
+  );
+  assert.notEqual(fixture.readReviewJobFile(failedJob.id).resumable, true);
+
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  fixture.growToSelfCollect("v3");
+  const third = fixture.runReview(["--resume"]);
+  assert.equal(third.status, 0, third.stderr);
+
+  const resumes = fixture.requests.filter((entry) => entry.method === "thread/resume");
+  assert.equal(resumes.length, 1, "the next run must resume rather than start fresh");
+  assert.equal(resumes[0].params.threadId, lineageThreadId);
 });
 
 test("an inline-diff --resume run with no prior thread starts a named persistent thread", () => {

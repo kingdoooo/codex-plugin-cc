@@ -139,6 +139,24 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+// The resumable tag has to be applied at job creation, because the review reuse
+// resolver only ever considers the NEWEST resumable job and an in-flight run
+// must already be visible as one (otherwise a concurrent run would resume the
+// very thread this one is using). That means the tag is set before we know
+// whether a thread ever opened. A run that finishes without one has to give it
+// back: the resolver reads a resumable job with no threadId as "start fresh" and
+// stops there, so such a job permanently shadows the real thread lineage. Two
+// ordinary triggers, both of which return/throw before reaching Codex: an
+// empty-diff review short-circuiting to an approve verdict on a clean tree, and
+// a review dying on a bad --base ref.
+//
+// Returns a patch fragment, empty when there is nothing to correct. `false`
+// rather than a deletion because upsertJob merges patches shallowly and cannot
+// remove a key; every reader tests for `=== true`.
+function buildResumableCorrection(job, threadId) {
+  return job.resumable === true && !threadId ? { resumable: false } : {};
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
     ...job,
@@ -155,26 +173,30 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    const threadId = execution.threadId ?? null;
+    const resumableCorrection = buildResumableCorrection(job, threadId);
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
-      threadId: execution.threadId ?? null,
+      threadId,
       turnId: execution.turnId ?? null,
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
       result: execution.payload,
-      rendered: execution.rendered
+      rendered: execution.rendered,
+      ...resumableCorrection
     });
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: completionStatus,
-      threadId: execution.threadId ?? null,
+      threadId,
       turnId: execution.turnId ?? null,
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
-      completedAt
+      completedAt,
+      ...resumableCorrection
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
@@ -182,6 +204,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
+    // A thread that opened before the failure was already persisted by
+    // createJobProgressUpdater, so consult the stored record rather than the
+    // seed job: only a run that never got that far gives the tag back.
+    const resumableCorrection = buildResumableCorrection(job, existing.threadId ?? null);
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
@@ -189,7 +215,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       pid: null,
       completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null,
+      ...resumableCorrection
     });
     upsertJob(job.workspaceRoot, {
       id: job.id,
@@ -197,7 +224,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: "failed",
       pid: null,
       errorMessage,
-      completedAt
+      completedAt,
+      ...resumableCorrection
     });
     throw error;
   }
