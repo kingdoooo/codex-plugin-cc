@@ -6,6 +6,27 @@ import assert from "node:assert/strict";
 import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
+// Runs the exact git command collectReviewContext measures for a branch diff, so
+// boundary tests can pin the caps to a real byte count instead of crafting one.
+function measureBranchDiffBytes(cwd, baseRef) {
+  const mergeBase = run("git", ["merge-base", "HEAD", baseRef], { cwd }).stdout.trim();
+  const diff = run("git", ["diff", "--binary", "--no-ext-diff", "--submodule=diff", `${mergeBase}..HEAD`], { cwd });
+  return Buffer.byteLength(diff.stdout, "utf8");
+}
+
+// Single-file branch diff of a non-trivial size, committed so the tree is clean
+// and resolveReviewTarget picks branch mode.
+function seedSingleFileBranchDiff(cwd) {
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'v1';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  run("git", ["checkout", "-b", "feature/test"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), `export const value = '${"x".repeat(400)}';\n`);
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "change"], { cwd });
+}
+
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
@@ -471,4 +492,77 @@ test("fed branch-mode guidance keeps the unqualified wording (no untracked conce
   assert.equal(context.investigationInline, true);
   assert.match(context.collectionGuidance, /full diff is embedded below/i);
   assert.doesNotMatch(context.collectionGuidance, /could not be embedded/i);
+});
+
+test("a diff of exactly the single-shot byte cap still routes to inline-diff", () => {
+  // Both budgets are inclusive (`<=`). Pin the cap to the diff's real measured
+  // size: equal-to-cap must stay inline, so an off-by-one tightening to `<`
+  // shows up here rather than silently pushing borderline reviews off the cheap
+  // single-turn path.
+  const cwd = makeTempDir();
+  seedSingleFileBranchDiff(cwd);
+
+  const target = resolveReviewTarget(cwd, { base: "main" });
+  const diffBytes = measureBranchDiffBytes(cwd, "main");
+  const context = collectReviewContext(cwd, target, { maxInlineDiffBytes: diffBytes });
+
+  assert.equal(context.fileCount, 1);
+  assert.equal(context.diffBytes, diffBytes, "cap must be pinned to the real measured diff size");
+  assert.equal(context.inputMode, "inline-diff", "exactly at the cap is within budget");
+});
+
+test("one byte over the single-shot cap flips to self-collect", () => {
+  const cwd = makeTempDir();
+  seedSingleFileBranchDiff(cwd);
+
+  const target = resolveReviewTarget(cwd, { base: "main" });
+  const diffBytes = measureBranchDiffBytes(cwd, "main");
+  const context = collectReviewContext(cwd, target, { maxInlineDiffBytes: diffBytes - 1 });
+
+  assert.equal(context.fileCount, 1);
+  assert.equal(context.diffBytes, diffBytes);
+  assert.equal(context.inputMode, "self-collect", "one byte over the cap must leave the inline path");
+  // Still well under the (much larger) default investigation budget, so the diff
+  // is fed to the multi-turn prompt rather than dropped.
+  assert.equal(context.investigationInline, true);
+});
+
+test("a diff of exactly the investigation budget is still fed inline", () => {
+  // maxInlineDiffBytes: 0 forces the single-shot path to lose, isolating the
+  // investigation budget as the only decision under test.
+  const cwd = makeTempDir();
+  seedSingleFileBranchDiff(cwd);
+
+  const target = resolveReviewTarget(cwd, { base: "main" });
+  const diffBytes = measureBranchDiffBytes(cwd, "main");
+  const context = collectReviewContext(cwd, target, {
+    maxInlineDiffBytes: 0,
+    investigationInlineMaxBytes: diffBytes
+  });
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.equal(context.diffBytes, diffBytes, "budget must be pinned to the real measured diff size");
+  assert.equal(context.investigationInline, true, "exactly at the budget is within budget");
+  assert.match(context.content, /## Branch Diff/);
+  assert.match(context.content, /diff --git/);
+  assert.match(context.collectionGuidance, /full diff is embedded below/i);
+});
+
+test("one byte over the investigation budget falls back to a blind summary", () => {
+  const cwd = makeTempDir();
+  seedSingleFileBranchDiff(cwd);
+
+  const target = resolveReviewTarget(cwd, { base: "main" });
+  const diffBytes = measureBranchDiffBytes(cwd, "main");
+  const context = collectReviewContext(cwd, target, {
+    maxInlineDiffBytes: 0,
+    investigationInlineMaxBytes: diffBytes - 1
+  });
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.equal(context.diffBytes, diffBytes);
+  assert.equal(context.investigationInline, false, "one byte over the budget must stop feeding the diff");
+  assert.match(context.content, /## Changed Files/);
+  assert.doesNotMatch(context.content, /diff --git/);
+  assert.match(context.collectionGuidance, /lightweight summary/i);
 });

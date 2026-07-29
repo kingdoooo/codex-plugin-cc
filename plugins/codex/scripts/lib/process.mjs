@@ -7,6 +7,16 @@ export function runCommand(command, args = [], options = {}) {
     env: options.env,
     encoding: "utf8",
     input: options.input,
+    // This key must stay PRESENT even when undefined. spawnSync reads a
+    // present-but-undefined maxBuffer as "no cap", while an omitted key applies
+    // its own 1 MiB default. Review context collection (collectBranchContext /
+    // collectWorkingTreeContext via gitChecked) passes no maxBuffer and embeds
+    // diffs up to CODEX_COMPANION_INVESTIGATION_INLINE_MAX_BYTES, whose 1MB
+    // default is exactly that 1 MiB cap — zero margin, and any env raise puts
+    // collected diffs past it. Dropping the key would then abort collection with
+    // ENOBUFS; only measureGitOutputBytes has a sentinel for that error, so the
+    // collection call sites have no recovery. Do not rewrite this as a
+    // conditional spread that omits falsy options.
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
