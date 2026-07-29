@@ -70,7 +70,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  validateReviewResultShape
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -712,9 +713,20 @@ async function executeReviewRun(request) {
   // output) carries a stale non-zero `result.status` from buildResultStatus.
   // Since we produced a usable verdict and did not flag the run failed, exit
   // success — otherwise the foreground command exits non-zero and background
-  // jobs are recorded as failed despite a valid review. Conversely, a genuinely
-  // failed run keeps its non-zero status.
-  const exitStatus = (!payload.failed && parsed.parsed) ? 0 : result.status;
+  // jobs are recorded as failed despite a valid review. Conversely, a run that
+  // produced no usable verdict must exit non-zero even when the finalize turn
+  // itself "completed" (status 0): runTrackedJob turns the exit status into the
+  // job status, and a review recorded `completed` with a real threadId is
+  // exactly what the reuse resolver accepts — so exiting 0 here would also hand
+  // a failed review's thread to the next --resume run.
+  //
+  // "Usable" has to mean schema-shaped, not merely JSON-parseable. The two
+  // observed no-verdict shapes are a finalize that emits a tool-call stub like
+  // {"cmd":"wc -l foo.js"} — valid JSON, so `parsed.parsed` is truthy and
+  // `payload.failed` stays false — and a double-empty finalize, which does set
+  // `payload.failed`. Both must fail the run.
+  const hasUsableVerdict = Boolean(parsed.parsed) && !validateReviewResultShape(parsed.parsed);
+  const exitStatus = (!payload.failed && hasUsableVerdict) ? 0 : (result.status || 1);
 
   return {
     exitStatus,

@@ -21,7 +21,11 @@ function formatLineRange(finding) {
   return `:${finding.line_start}-${finding.line_end}`;
 }
 
-function validateReviewResultShape(data) {
+// Exported so the review runner can decide the exit status on the same notion
+// of "usable verdict" the renderer displays. Parsing alone is not enough: a
+// finalize turn that emits a tool-call stub like {"cmd":"wc -l foo.js"} is
+// valid JSON and would otherwise pass for a completed review.
+export function validateReviewResultShape(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return "Expected a top-level JSON object.";
   }

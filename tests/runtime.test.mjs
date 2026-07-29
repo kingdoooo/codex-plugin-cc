@@ -2662,6 +2662,31 @@ function setupResumeReviewRepo() {
       state.queue.push({ finalAnswer: { text: RESUME_APPROVE_VERDICT } });
       fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
     },
+    // A review whose finalize never yields a verdict: the recon turn converges,
+    // then BOTH finalize attempts (the retry included) violate the contract by
+    // emitting a tool-call stub instead of the schema JSON. The stub is valid
+    // JSON, so it parses — the review is only recognizable as failed by its
+    // shape.
+    queueFinalizeToolCallStub() {
+      const state = readFakeState();
+      state.queue.push({ commands: [], finalAnswer: { text: "Investigation done." } });
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        state.queue.push({
+          commands: [{ command: "wc -l src/a.js", exitCode: 0 }],
+          finalAnswer: { text: '{"cmd":"wc -l src/a.js"}' }
+        });
+      }
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
+    // The other no-verdict shape: both finalize attempts complete carrying no
+    // agent message at all (the observed upstream Message-item drop).
+    queueDoubleEmptyFinalize() {
+      const state = readFakeState();
+      state.queue.push({ commands: [], finalAnswer: { text: "Investigation done." } });
+      state.queue.push({ commands: [], finalAnswer: null });
+      state.queue.push({ commands: [], finalAnswer: null });
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    },
     // A turn that opens (turn/started is emitted) and then dies without ever
     // completing: the model may already have been billed for it.
     queueTurnHangAfterStarted() {
@@ -3066,6 +3091,66 @@ test("a --resume run that fails before opening a thread does not shadow the line
   const resumes = fixture.requests.filter((entry) => entry.method === "thread/resume");
   assert.equal(resumes.length, 1, "the next run must resume rather than start fresh");
   assert.equal(resumes[0].params.threadId, lineageThreadId);
+});
+
+// -------------------------------------------------------------------
+// A review that never produced a verdict must not be recorded as a
+// success. Both no-verdict shapes are covered: a finalize that keeps
+// emitting a tool-call stub, and a finalize that keeps coming back
+// empty. The exit status is what runTrackedJob turns into the job
+// status, and a "completed" record with a real threadId is exactly what
+// the reuse resolver accepts — so exiting 0 here also hands a failed
+// review's thread to the next --resume run.
+// -------------------------------------------------------------------
+
+test("a review whose finalize only ever emits a tool-call stub is recorded failed", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueFinalizeToolCallStub();
+
+  const result = fixture.runReview(["--resume"]);
+  assert.notEqual(result.status, 0, "a review with no usable verdict must exit non-zero");
+
+  const [job] = fixture.readReviewJobs();
+  assert.equal(job.status, "failed", "the tracked job must record the failure");
+  assert.equal(fixture.readReviewJobFile(job.id).status, "failed");
+  // The thread is real and carries the investigation, but the run failed, so
+  // the documented contract is that it is never resumed.
+  assert.ok(job.threadId, "the run did open a thread");
+
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  fixture.growToSelfCollect("v3");
+  const next = fixture.runReview(["--resume"]);
+  assert.equal(next.status, 0, next.stderr);
+  assert.ok(
+    !fixture.requests.some((entry) => entry.method === "thread/resume"),
+    "a failed review's thread must not be reused by the next --resume run"
+  );
+  assert.equal(fixture.requests.filter((entry) => entry.method === "thread/start").length, 1);
+});
+
+test("a review whose finalize comes back empty twice is recorded failed", () => {
+  const fixture = setupResumeReviewRepo();
+  fixture.queueDoubleEmptyFinalize();
+
+  const result = fixture.runReview(["--resume"]);
+  assert.notEqual(result.status, 0, "a no-content review must exit non-zero");
+
+  const [job] = fixture.readReviewJobs();
+  assert.equal(job.status, "failed");
+  assert.equal(fixture.readReviewJobFile(job.id).status, "failed");
+  assert.ok(job.threadId, "the run did open a thread");
+
+  fixture.clearRequests();
+  fixture.queueOneReview();
+  fixture.growToSelfCollect("v3");
+  const next = fixture.runReview(["--resume"]);
+  assert.equal(next.status, 0, next.stderr);
+  assert.ok(
+    !fixture.requests.some((entry) => entry.method === "thread/resume"),
+    "a failed review's thread must not be reused by the next --resume run"
+  );
+  assert.equal(fixture.requests.filter((entry) => entry.method === "thread/start").length, 1);
 });
 
 test("an inline-diff --resume run with no prior thread starts a named persistent thread", () => {
