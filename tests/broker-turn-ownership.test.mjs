@@ -93,7 +93,16 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 `;
 }
 
-async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 25, message = "condition" } = {}) {
+// Generous by default because every wait in this file is either a process-spawn
+// or a message-propagation wait, never a semantic deadline: the broker spawns the
+// fake upstream and completes its handshake before it starts listening, and
+// `node --test` runs all test files concurrently, so those spawns can be starved
+// for seconds on a loaded machine. A tight budget here fails the test before it
+// reaches an assertion, which is noise rather than signal. The behavioral
+// assertions themselves do not depend on how long the wait took.
+const SPAWN_TOLERANT_TIMEOUT_MS = 30_000;
+
+async function waitFor(predicate, { timeoutMs = SPAWN_TOLERANT_TIMEOUT_MS, intervalMs = 25, message = "condition" } = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const value = await predicate();
@@ -255,7 +264,11 @@ async function connectClient(socketPath) {
   return client;
 }
 
-function waitForBrokerExit(child, { timeoutMs = 8000 } = {}) {
+// The assertion is that the broker exits at all, not that it exits quickly: with
+// a 60s idle window an exit can only be the abandonment teardown, so a long wait
+// stays meaningful. The wait itself gates on process teardown (closing the
+// upstream app-server, then exiting), so it gets the spawn-tolerant budget.
+function waitForBrokerExit(child, { timeoutMs = SPAWN_TOLERANT_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     if (child.exitCode !== null) {
       resolve(child.exitCode);
@@ -315,8 +328,12 @@ test("broker does not route an abandoned turn's notifications to an unrelated cl
   });
 
   // A turn that completed and then closed is normal teardown, not abandonment.
+  // A regression here would exit the broker promptly on the close, so a short
+  // grace period is enough to catch it; unlike the waits above, a longer one only
+  // slows the suite down. The stronger check follows: the next connect and turn
+  // only succeed against a broker that is still alive.
   first.close();
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await new Promise((resolve) => setTimeout(resolve, 500));
   assert.equal(broker.child.exitCode, null, "a completed turn followed by a clean close must not tear the broker down");
 
   const second = await broker.connectClient();
