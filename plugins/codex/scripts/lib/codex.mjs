@@ -23,6 +23,8 @@
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
  *   sawSubagentWork: boolean,
+ *   parentAnsweredSinceSubagentWork: boolean,
+ *   inferredCompletion: boolean,
  *   inferredCompletionQuietMs: number,
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
@@ -90,10 +92,13 @@ const DEFAULT_TURN_CEILING_MS = 7_200_000;
 // Demoted-inference quiet window (Defect A). Inferred turn completion is a
 // FALLBACK for the subagent/collab case where the main thread never emits a
 // real turn/completed. It is eligible only after (a) the turn actually spawned
-// subagent/collab work, (b) that work has drained, and (c) the turn has been
-// silent for this long with no turn/completed. The window re-arms on every
-// belonging item/message, so only genuine silence triggers it. Plain recon
-// turns never infer — they wait for the real turn/completed.
+// subagent/collab work, (b) that work has drained, (c) the main thread has
+// since delivered a message of its own, and (d) the turn has been silent for
+// this long with no turn/completed. The window re-arms on every belonging
+// item/message, so only genuine silence triggers it. Plain recon turns never
+// infer — they wait for the real turn/completed. Because silence alone is never
+// enough (condition (c)), this window does not have to cover the longest
+// healthy silence the way the stall watchdog does.
 const DEFAULT_INFERRED_COMPLETION_QUIET_MS = 15_000;
 
 function resolveInferredCompletionQuietMs(explicitMs) {
@@ -430,6 +435,8 @@ function createTurnCaptureState(threadId, options = {}) {
     completed: false,
     finalAnswerSeen: false,
     sawSubagentWork: false,
+    parentAnsweredSinceSubagentWork: false,
+    inferredCompletion: false,
     inferredCompletionQuietMs: resolveInferredCompletionQuietMs(options.inferredCompletionQuietMs),
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
@@ -473,7 +480,12 @@ function completeTurn(state, turn = null, options = {}) {
   }
 
   if (options.inferred) {
-    emitProgress(state.onProgress, "Turn completion inferred after the main thread finished and subagent work drained.", "finalizing");
+    state.inferredCompletion = true;
+    emitProgress(
+      state.onProgress,
+      "Turn completion inferred: subagent work drained and the main thread delivered its answer, but no turn/completed arrived.",
+      "finalizing"
+    );
   }
 
   state.resolveCompletion(state);
@@ -486,11 +498,22 @@ function completeTurn(state, turn = null, options = {}) {
 // eligible, arm a quiet timer that re-arms on every subsequent belonging
 // item/message (see scheduleInferredCompletion call sites) and fires only after
 // inferredCompletionQuietMs of genuine silence with no real turn/completed.
+//
+// Drained subagents alone are NOT enough. Every subagent-scoped term can read
+// "drained" while the parent is still reasoning upstream, and this protocol has
+// no other parent-scoped terminal signal to lean on (turn/completed is exactly
+// the thing the buggy app-server drops). So also require that the parent thread
+// spoke a non-empty message AFTER the last subagent activity: "the parent
+// delivered its answer, then went quiet" is the shape the fallback exists for,
+// whereas "the parent never spoke" is a turn still in flight. That distinction
+// matters because healthy turns here go silent for 600s+ while reasoning — far
+// longer than any quiet window we could pick (default 15s).
 function inferenceEligible(state) {
   return (
     !state.completed &&
     !state.finalTurn &&
     state.sawSubagentWork &&
+    state.parentAnsweredSinceSubagentWork &&
     state.pendingCollaborations.size === 0 &&
     state.activeSubagentTurns.size === 0
   );
@@ -533,6 +556,9 @@ function recordItem(state, item, lifecycle, threadId = null) {
     if (!threadId || threadId === state.threadId) {
       if (lifecycle === "started" || item.status === "inProgress") {
         state.sawSubagentWork = true;
+        // A parent answer that predates this collaboration says nothing about
+        // whether the parent is done now: it delegated again afterwards.
+        state.parentAnsweredSinceSubagentWork = false;
         state.pendingCollaborations.add(item.id);
       } else if (lifecycle === "completed") {
         state.pendingCollaborations.delete(item.id);
@@ -553,15 +579,22 @@ function recordItem(state, item, lifecycle, threadId = null) {
     if (item.text) {
       if (!threadId || threadId === state.threadId) {
         state.lastAgentMessage = item.text;
-        if (lifecycle === "completed" && item.phase === "final_answer") {
-          // Bookkeeping only; finalAnswerSeen is no longer part of the inference
-          // gate (Defect A) — a readiness cue must not complete a plain turn.
-          state.finalAnswerSeen = true;
-          // Do NOT infer from a readiness cue on a plain turn. Only re-arm the
-          // quiet fallback when subagent work has already happened and drained.
-          if (inferenceEligible(state)) {
-            scheduleInferredCompletion(state);
+        if (lifecycle === "completed") {
+          if (item.phase === "final_answer") {
+            // Bookkeeping only; finalAnswerSeen is no longer part of the
+            // inference gate (Defect A) — a readiness cue must not complete a
+            // plain turn.
+            state.finalAnswerSeen = true;
           }
+          // The parent has now delivered prose on this turn. This is the only
+          // parent-scoped evidence the protocol still gives us once the buggy
+          // app-server drops turn/completed, so it is a REQUIRED term of the
+          // inference gate (never sufficient on its own — see inferenceEligible).
+          // Subagents usually drain BEFORE the parent answers, so this is also
+          // the point at which the quiet window must first be armed; the call
+          // self-guards, so a plain turn with no subagent work still never infers.
+          state.parentAnsweredSinceSubagentWork = true;
+          scheduleInferredCompletion(state);
         }
       }
       if (lifecycle === "completed") {
@@ -865,7 +898,18 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     armIdle();
     // `work` wins under normal operation; the guards only fire on a stall, an
     // over-long turn, or app-server death.
-    return await Promise.race([work, idlePromise, ceiling, exit]);
+    const result = await Promise.race([work, idlePromise, ceiling, exit]);
+    // An inferred completion is a GUESS: no turn/completed ever arrived, so the
+    // turn may still be live upstream. Returning here lets the runner open the
+    // next turn on this same thread, which would leave two live turns
+    // interleaving notifications. Interrupt first — a no-op upstream if the turn
+    // genuinely finished — so a wrong inference costs a redundant RPC rather
+    // than an overlapping turn. Bounded (5s) like the abandonment interrupt so
+    // this cannot hang a run that otherwise succeeded.
+    if (state.inferredCompletion && state.turnId) {
+      await interruptTurnBestEffort(client, threadId, state.turnId);
+    }
+    return result;
   } catch (error) {
     // A watchdog abandoned a turn that may still be running upstream. Stopping
     // our wait is not enough — on a shared broker the turn keeps mutating the

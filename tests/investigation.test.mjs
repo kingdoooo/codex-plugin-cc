@@ -1642,6 +1642,99 @@ test("plain recon turn does not infer completion from a readiness cue (Defect A 
   }
 });
 
+test("drained subagents do not infer completion while the parent turn is still silent", async () => {
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.enableSerialization();
+    // Recon turn 1: a subagent is spawned and fully drained (sub-thread
+    // turn/completed + collabAgentToolCall "completed"), then the PARENT goes
+    // silent — no final answer, no turn/completed. Every subagent-scoped term of
+    // the gate reads "drained" while the parent is still reasoning upstream.
+    // Backends measured on this repo stay silent 600s+ mid-turn, so silence is
+    // not evidence of completion.
+    fake.queueSubagentThenParentSilent();
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      // Quiet window far below the idle timeout: on UNFIXED code inference fires
+      // at 60ms and finalize is dispatched onto a thread whose turn 1 is still
+      // live. On FIXED code the parent never spoke, so nothing is inferred and
+      // only the idle watchdog (500ms) ends the run.
+      inferredCompletionQuietMs: 60,
+      turnIdleTimeoutMs: 500
+    });
+
+    assert.ok(result.error, "a silent parent turn must not be inferred complete");
+    assert.match(result.error.message, /idle|timeout|timed out/i);
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 1, "no second turn may open while turn 1 is unresolved");
+  } finally {
+    fake.close();
+  }
+});
+
+test("inferred completion still fires once the parent has answered but turn/completed never arrives", async () => {
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // The scenario the fallback exists for: subagent work drains, the parent
+    // emits its real final answer, and the app-server drops the parent
+    // turn/completed. Inference must still rescue this turn.
+    fake.queueSubagentThenParentSilent({ parentAnswer: "Investigation complete. Verdict ready." });
+    fake.queueTurnResponse({ finalAnswer: { text: STRUCTURED_REVIEW } });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      inferredCompletionQuietMs: 60,
+      turnIdleTimeoutMs: 2000
+    });
+
+    assert.equal(result.error ?? null, null, "the drained-subagent fallback must still rescue this turn");
+    assert.equal(result.finalMessage, STRUCTURED_REVIEW, "finalize output is preserved");
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 2, "recon infers completion, then finalize is dispatched");
+  } finally {
+    fake.close();
+  }
+});
+
+test("inferred completion interrupts the inferred turn so it cannot stay live upstream", async () => {
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Inference is a guess, so it must never be the only thing standing between
+    // a live upstream turn and the next turn on the same thread. Even in the
+    // legitimate shape (parent answered, turn/completed dropped) the turn is
+    // interrupted first — a no-op upstream if it really did finish.
+    fake.queueSubagentThenParentSilent({ parentAnswer: "Investigation complete. Verdict ready." });
+    fake.queueTurnResponse({ finalAnswer: { text: STRUCTURED_REVIEW } });
+
+    await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      inferredCompletionQuietMs: 60,
+      turnIdleTimeoutMs: 2000
+    });
+
+    const interrupts = fake.requests.filter((r) => r.method === "turn/interrupt");
+    assert.equal(interrupts.length, 1, "the inferred turn must be interrupted before the next turn opens");
+    assert.equal(interrupts[0].params.turnId, "turn_1", "the interrupt must target the inferred turn");
+    const order = fake.requests.map((r) => r.method);
+    assert.ok(
+      order.indexOf("turn/interrupt") < order.lastIndexOf("turn/start"),
+      `the interrupt must precede the next turn/start (order: ${order.join(", ")})`
+    );
+  } finally {
+    fake.close();
+  }
+});
+
 test("a verdict streamed after a readiness cue is captured, not discarded (Defect A end-to-end)", async () => {
   const cwd = makeTempDir("codex-inv-test-");
   const fake = setupFakeCodex({ cwd });

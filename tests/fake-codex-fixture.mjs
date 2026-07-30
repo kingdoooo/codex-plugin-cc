@@ -617,6 +617,67 @@ rl.on("line", (line) => {
             break;
           }
 
+          if (entry && entry.subagentThenParentSilent) {
+            // Spawn a subagent, drain it completely (sub-thread turn/completed
+            // plus collabAgentToolCall status "completed"), then leave the PARENT
+            // thread permanently silent: no agentMessage, no turn/completed. This
+            // is the slow-reasoning-backend shape — the parent is still thinking
+            // upstream while every subagent-scoped term of the inference gate
+            // reads "drained". Opt into a parent answer with parentAnswer to
+            // model the case inference legitimately exists to work around.
+            const subThread = nextThread(state, thread.cwd, true);
+            subThread.name = "design-challenger";
+            saveState(state);
+            const subTurnId = nextTurnId(state);
+            const collabItem = (status) => ({
+              type: "collabAgentToolCall",
+              id: "collab_" + turnId,
+              tool: "wait",
+              status,
+              senderThreadId: thread.id,
+              receiverThreadIds: [subThread.id],
+              prompt: "Challenge the implementation approach",
+              model: null,
+              reasoningEffort: null,
+              agentsStates: {
+                [subThread.id]: { status, message: status === "completed" ? "Finished" : "Investigating" }
+              }
+            });
+
+            send({ method: "thread/started", params: { thread: { ...buildThread(subThread), name: "design-challenger", agentNickname: "design-challenger" } } });
+            send({ method: "item/started", params: { threadId: thread.id, turnId, item: collabItem("inProgress") } });
+            send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
+            send({
+              method: "item/completed",
+              params: {
+                threadId: subThread.id,
+                turnId: subTurnId,
+                item: { type: "agentMessage", id: "msg_" + subTurnId, text: "Subagent analysis done.", phase: "analysis" }
+              }
+            });
+            send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: collabItem("completed") } });
+
+            if (entry.subagentThenParentSilent.parentAnswer) {
+              send({
+                method: "item/completed",
+                params: {
+                  threadId: thread.id,
+                  turnId,
+                  item: {
+                    type: "agentMessage",
+                    id: "parent_" + turnId,
+                    text: entry.subagentThenParentSilent.parentAnswer,
+                    phase: "final_answer"
+                  }
+                }
+              });
+            }
+            // Never emit the parent turn/completed: that is the upstream bug the
+            // inference fallback exists for. The parent stays live either way.
+            break;
+          }
+
           if (entry && entry.turnError) {
             send({ method: "error", params: { threadId: thread.id, turnId, error: { message: entry.turnError.message } } });
           }
@@ -836,6 +897,7 @@ rl.on("line", (line) => {
 	      }
 
 	      case "turn/interrupt": {
+	        recordRequest(state, message);
 	        state.lastInterrupt = {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
@@ -950,6 +1012,16 @@ export function setupFakeCodex({ cwd } = {}) {
       const state = readState();
       if (!state.queue) { state.queue = []; }
       state.queue.push({ hangAfterStarted: true });
+      writeState(state);
+    },
+    // Drain a subagent fully, then leave the parent turn live and silent (no
+    // parent turn/completed — the upstream bug the inference fallback targets).
+    // Pass `parentAnswer` to have the parent emit its final answer first, which
+    // is the only shape where inferring completion is actually safe.
+    queueSubagentThenParentSilent({ parentAnswer = null } = {}) {
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push({ subagentThenParentSilent: { parentAnswer } });
       writeState(state);
     },
     // Make the next call to `method` (a thread-setup RPC) go unanswered. Unlike
